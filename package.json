@@ -1,0 +1,40 @@
+{
+  "name": "beam-share",
+  "version": "0.1.0",
+  "description": "Terminal UI for peer-to-peer file sharing on your local network. Run `npx beam-share` on two machines and send files.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SC136/beam-share.git"
+  },
+  "homepage": "https://github.com/SC136/beam-share#readme",
+  "bugs": {
+    "url": "https://github.com/SC136/beam-share/issues"
+  },
+  "type": "module",
+  "bin": {
+    "beam-share": "bin/beam.js",
+    "beam": "bin/beam.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node bin/beam.js",
+    "test": "node --test --test-concurrency=1 \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "lan",
+    "p2p",
+    "file-transfer",
+    "file-sharing",
+    "tui",
+    "terminal",
+    "local-network"
+  ],
+  "license": "MIT"
+}
