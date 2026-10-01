@@ -12,7 +12,7 @@ export const LOGO = [
 ];
 export const LOGO_WIDTH = Math.max(...LOGO.map((l) => l.length));
 export const LOGO_HEIGHT = LOGO.length;
-export const TAGLINE = 'send files across your LAN - no cloud, no accounts';
+export const TAGLINE = 'send files over your LAN or the internet - no cloud';
 
 // Cyan fading to blue, top to bottom.
 const LOGO_COLORS = [51, 45, 39, 33, 27];

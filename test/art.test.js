@@ -59,7 +59,8 @@ test('empty main screen shows the wordmark when there is room, and hides it when
   const app = new App(beam, { now: () => t });
   const roomy = screen(app, 100, 30);
   for (const row of LOGO) assert.ok(roomy.includes(row), `logo row present: ${row}`);
-  assert.match(roomy, /send files across your LAN/);
+  assert.match(roomy, /send files over your LAN or the internet - no cloud/);
+  assert.ok('send files over your LAN or the internet - no cloud'.length <= 52, 'fits the narrowest supported terminal');
   assert.match(roomy, /\[ you \] .* \[ \?\?\? \]/);
   assert.match(roomy, /Looking for devices on your network/);
   assert.match(roomy, /No transfers yet/);

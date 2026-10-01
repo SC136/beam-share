@@ -3,6 +3,7 @@
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import { isActive } from '../beam.js';
+import { generateCode } from '../room.js';
 import { formatBytes, formatDuration, formatRate, shortFp } from '../util.js';
 import { CAT_WIDTH, LOGO_HEIGHT, LOGO_WIDTH, TAGLINE, brandLines, catColor, catFace, catLines, linkLine } from './art.js';
 import { TextInput } from './input.js';
@@ -48,7 +49,7 @@ export class App {
     this.lastDir = startDir;
     this.queued = queued;
 
-    this.mode = 'main'; // main | picker | addpeer | help
+    this.mode = 'main'; // main | picker | addpeer | room | help
     this.focus = 'peers'; // peers | transfers
     this.peerSel = null;
     this.transferSel = null;
@@ -57,6 +58,7 @@ export class App {
     this.picker = null;
     this.pickerPeer = null;
     this.input = null;
+    this.roomUi = { step: 'menu', input: null, then: null, busy: false, error: null }; // step: menu | code | relay
     this.status = null;
     this.quitArmedUntil = 0;
 
@@ -161,6 +163,7 @@ export class App {
     if (k.ctrl && k.name === 'c') return this.requestQuit();
     if (this.mode === 'picker') this.picker.handleKey(str, k);
     else if (this.mode === 'addpeer') this._addPeerKey(str, k);
+    else if (this.mode === 'room') this._roomKey(str, k);
     else if (this.mode === 'help') this.mode = 'main';
     else if (this.offers.length) this._offerKey(str, k);
     else this._mainKey(str, k);
@@ -209,6 +212,10 @@ export class App {
       case 'a':
         this.input = new TextInput('');
         this.mode = 'addpeer';
+        return;
+      case 'r':
+        this.roomUi = { step: 'menu', input: null, then: null, busy: false, error: null };
+        this.mode = 'room';
         return;
       case 'x': return this._cancelSelected();
       case 'c':
@@ -266,6 +273,78 @@ export class App {
     }
   }
 
+  // ------------------------------------------------------- internet room
+
+  _roomKey(str, k) {
+    const ui = this.roomUi;
+    if (ui.step === 'code' || ui.step === 'relay') {
+      const r = ui.input.handle(str, k);
+      if (r === 'cancel') Object.assign(ui, { step: 'menu', input: null, then: null, error: null });
+      else if (r === 'submit') return ui.step === 'code' ? this._joinRoom(ui.input.value) : this._saveRelay(ui.input.value);
+      return;
+    }
+    if (k.name === 'escape' || str === 'q') {
+      this.mode = 'main';
+      return;
+    }
+    if (this.beam.roomInfo()) {
+      if (str === 'l') {
+        this.beam.leaveRoom();
+        Object.assign(ui, { busy: false, error: null });
+        this.flash('Left the room');
+      }
+      return;
+    }
+    if (ui.busy) return;
+    switch (str) {
+      case 'c': return this.beam.relayUrl ? this._joinRoom(generateCode()) : this._askRelay('create');
+      case 'j': return this.beam.relayUrl ? this._askCode() : this._askRelay('join');
+      case 's': return this._askRelay(null);
+      default:
+    }
+  }
+
+  _askRelay(then) {
+    Object.assign(this.roomUi, { step: 'relay', then, error: null, input: new TextInput(this.beam.relayUrl ?? '') });
+  }
+
+  _askCode() {
+    Object.assign(this.roomUi, { step: 'code', then: null, error: null, input: new TextInput('') });
+  }
+
+  _saveRelay(value) {
+    const ui = this.roomUi;
+    this.beam.setRelay(value).then(
+      (url) => {
+        const then = ui.then;
+        Object.assign(ui, { step: 'menu', input: null, then: null, error: null });
+        this.flash(`Relay set to ${url}`, 'ok');
+        if (then === 'create') this._joinRoom(generateCode());
+        else if (then === 'join') this._askCode();
+        this.onChange();
+      },
+      (e) => {
+        ui.error = e.message;
+        this.onChange();
+      },
+    );
+  }
+
+  _joinRoom(code) {
+    const ui = this.roomUi;
+    Object.assign(ui, { step: 'menu', input: null, then: null, error: null, busy: true });
+    this.beam.joinRoom(code).then(
+      () => {
+        ui.busy = false;
+        this.flash('You are in the room - share the code with your friends', 'ok', 6000);
+      },
+      (e) => {
+        Object.assign(ui, { busy: false, error: e.message });
+        this.flash(`Couldn't join the room: ${e.message}`, 'bad', 8000);
+      },
+    );
+  }
+
   _openPicker() {
     const peer = this.selectedPeer();
     if (!peer) return this.flash('No peer to send to yet - see the hint above, or press a to add one', 'warn');
@@ -310,6 +389,7 @@ export class App {
     let body;
     if (this.mode === 'picker') body = this._pickerBody(w, bodyH);
     else if (this.mode === 'addpeer') body = this._addPeerBody(w, bodyH);
+    else if (this.mode === 'room') body = this._roomBody(w, bodyH);
     else if (this.mode === 'help') body = this._helpBody(w, bodyH);
     else if (this.offers.length) body = this._offerBody(w, bodyH);
     else body = this._mainBody(w, bodyH);
@@ -322,11 +402,13 @@ export class App {
     // Most important first: if the line is too long, it's the tail that gets clipped.
     // The auto-accept badge is a safety signal, so the name gives way to it.
     const badge = this.beam.autoAccept ? '  ' + paint(' AUTO-ACCEPT ', { bold: true, fg: 16, bg: C.warn }) : '';
-    const nameRoom = Math.max(6, w - 15 - (badge ? 15 : 0));
+    const room = info.room;
+    const roomBadge = room ? '  ' + paint(room.state === 'online' ? ' ROOM ' : ' room... ', { bold: true, fg: 16, bg: room.state === 'online' ? C.ok : C.warn }) : '';
+    const nameRoom = Math.max(6, w - 15 - (badge ? 15 : 0) - (roomBadge ? 10 : 0));
     const name = fit(info.name, Math.min(strWidth(info.name), nameRoom));
     const mood = this._mood();
     const face = paint(catFace(mood, this.now()), { fg: catColor(mood), bold: true });
-    let s = paint(' beam ', { bold: true, fg: 16, bg: C.accent }) + ' ' + face + '  ' + paint(name, { bold: true }) + badge;
+    let s = paint(' beam ', { bold: true, fg: 16, bg: C.accent }) + ' ' + face + '  ' + paint(name, { bold: true }) + badge + roomBadge;
     return s + paint(`  ${addr}  id ${shortFp(info.fingerprint ?? '')}  ${G.down} ${tildify(info.downloadDir)}`, { fg: C.muted });
   }
 
@@ -349,11 +431,16 @@ export class App {
         ? [key('enter', 'go'), key('esc', 'cancel')]
         : [key('↑↓', 'move'), key('←→', 'up/open'), key('space', 'select'), key('s', 'send'), key('/', 'path'), key('.', 'hidden'), key('a', 'all'), key('esc', 'back')];
     } else if (this.mode === 'addpeer') keys = [key('enter', 'connect'), key('esc', 'cancel')];
+    else if (this.mode === 'room') {
+      if (this.roomUi.step !== 'menu') keys = [key('enter', 'confirm'), key('esc', 'back')];
+      else if (this.beam.roomInfo()) keys = [key('l', 'leave room'), key('esc', 'back')];
+      else keys = [key('c', 'create room'), key('j', 'join room'), key('s', 'relay'), key('esc', 'back')];
+    }
     else if (this.mode === 'help') keys = [key('any key', 'close')];
     else if (this.offers.length) keys = [key('y', 'accept'), key('n', 'decline')];
     else {
       keys = [
-        key('↑↓', 'select'), key('s', 'send'), key('tab', 'peers/transfers'), key('x', 'cancel'), key('a', 'add by IP'),
+        key('↑↓', 'select'), key('s', 'send'), key('r', 'internet'), key('tab', 'peers/transfers'), key('x', 'cancel'), key('a', 'add by IP'),
         key('o', 'open folder'), key('c', 'clear'), key('?', 'help'), key('q', 'quit'),
       ];
     }
@@ -387,11 +474,15 @@ export class App {
       const spin = SPINNER[Math.floor(this.now() / 150) % SPINNER.length];
       lines.push(linkLine(Math.floor(this.now() / 120), iw));
       lines.push(paint(`${spin} Looking for devices on your network...`, { fg: C.accent }));
-      lines.push(paint('Run `npx beam-share` on another device (same Wi-Fi).', { fg: C.muted }));
+      const inRoom = this.beam.roomInfo()?.state === 'online';
+      lines.push(
+        paint(inRoom ? 'Room open - waiting for friends (press r for the code).' : 'Run `npx beam-share` on another device (same Wi-Fi).', { fg: C.muted }),
+      );
       const waited = this.now() - this.startedAt;
       if (this.beam.discoveryError) lines.push(paint(`Discovery problem: ${this.beam.discoveryError}`, { fg: C.warn }));
       else if (waited > 10_000) lines.push(paint('No luck? Allow Node in the firewall, or press a.', { fg: C.warn }));
       else lines.push(paint("Can't see it? Press a to connect by IP address.", { fg: C.muted }));
+      if (!inRoom) lines.push(paint('Other network? Press r for an internet room.', { fg: C.muted }));
     } else {
       const showAddr = iw >= 44;
       const showFp = iw >= 64;
@@ -407,13 +498,14 @@ export class App {
         lines.push(
           paint(sel ? `${G.pointer} ` : '  ', { fg: C.accent, bg }) +
             paint(fit(p.name, nameW), { bold: sel, bg }) +
-            (showAddr ? paint(fit(`${p.address}:${p.port}`, addrW), { fg: C.muted, bg }) : '') +
+            (showAddr ? paint(fit(p.address ? `${p.address}:${p.port}` : 'via relay', addrW), { fg: C.muted, bg }) : '') +
             (showFp ? paint(fit(shortFp(p.id), fpW), { fg: C.muted, bg }) : '') +
             paint(fit(p.online ? `${G.on} online` : `${G.off} offline`, tagW), { fg: p.online ? C.ok : C.bad, bg }),
         );
       }
     }
-    return box({ title: `Peers (${peers.length})`, w, h, lines, focused });
+    const room = this.beam.roomInfo();
+    return box({ title: `Peers (${peers.length})${room ? ` - room ${room.state}` : ''}`, w, h, lines, focused });
   }
 
   _transfersBox(w, h, transfers) {
@@ -560,32 +652,87 @@ export class App {
     });
   }
 
+  _roomBody(w, h) {
+    const ui = this.roomUi;
+    const info = this.beam.roomInfo();
+    const bw = Math.min(w - 4, 72);
+    const iw = bw - 4;
+    const spin = SPINNER[Math.floor(this.now() / 150) % SPINNER.length];
+    const muted = (t) => paint(t, { fg: C.muted });
+    const lines = [];
+    if (ui.step === 'relay') {
+      lines.push(paint('Relay server', { bold: true }));
+      lines.push(muted('It introduces devices and carries their (end-to-end encrypted) traffic.'));
+      lines.push(muted('Examples: relay.example.com   203.0.113.5:7979   ws://localhost:7979'));
+      lines.push('');
+      lines.push(paint('Address: ', { fg: C.accent, bold: true }) + ui.input.render(iw - 9));
+      if (ui.error) lines.push('', paint(ui.error, { fg: C.bad }));
+    } else if (ui.step === 'code') {
+      lines.push(paint('Join a room', { bold: true }));
+      lines.push(muted('Enter the room code your friend shared with you.'));
+      lines.push('');
+      lines.push(paint('Code: ', { fg: C.accent, bold: true }) + ui.input.render(iw - 6));
+      if (ui.error) lines.push('', paint(ui.error, { fg: C.bad }));
+    } else if (info) {
+      const when = info.retryAt ? Math.max(0, Math.ceil((info.retryAt - this.now()) / 1000)) : 0;
+      lines.push(
+        info.state === 'online'
+          ? paint(`${G.on} online`, { fg: C.ok, bold: true }) + muted(`  ${info.members} other device${info.members === 1 ? '' : 's'} here`)
+          : info.state === 'connecting'
+            ? paint(`${spin} connecting...`, { fg: C.warn })
+            : paint(`${G.off} offline - retrying in ${when}s`, { fg: C.bad }) + (info.error ? muted(`  (${info.error})`) : ''),
+      );
+      lines.push(paint('Code:  ', { fg: C.accent, bold: true }) + paint(info.code, { bold: true, fg: C.title }));
+      lines.push(paint('Relay: ', { fg: C.accent, bold: true }) + muted(info.url));
+      lines.push('');
+      lines.push(muted('Anyone with this code can join and show up in your Peers list.'));
+      lines.push(muted('You still approve every transfer. Share the code privately.'));
+      if (info.strength === 'weak') lines.push(paint('This code is short and guessable - leave, then create a new room.', { fg: C.warn }));
+    } else {
+      lines.push(paint('Share files over the internet', { bold: true }));
+      lines.push(muted('Everyone who enters the same room code meets in your Peers list.'));
+      lines.push(muted('A relay server introduces you and carries the encrypted traffic.'));
+      lines.push('');
+      lines.push(paint('Relay: ', { fg: C.accent, bold: true }) + (this.beam.relayUrl ? muted(this.beam.relayUrl) : paint('not set yet - press s to set it', { fg: C.warn })));
+      if (ui.busy) lines.push(paint(`${spin} connecting...`, { fg: C.accent }));
+      else if (ui.error) lines.push(paint(ui.error, { fg: C.bad }));
+    }
+    lines.length = Math.min(lines.length, h - 2);
+    return center(box({ title: 'Internet room', w: bw, h: lines.length + 2, lines, focused: true }), bw, w, h);
+  }
+
   _helpBody(w, h) {
     const bw = Math.min(w - 4, 76);
+    // {h: heading} | {p: paragraph} | [keys, what it does]
     const rows = [
-      ['Main screen', ''],
+      { h: 'Main screen' },
       ['↑ ↓ / j k', 'move in the focused list'],
       ['tab', 'switch between Peers and Transfers'],
       ['s / enter', 'choose files to send to the selected peer'],
       ['a', 'add a peer by IP address (if discovery is blocked)'],
+      ['r', 'internet room: share with friends on other networks'],
       ['x', 'cancel the selected transfer (focus Transfers first)'],
       ['c', 'clear finished transfers'],
       ['o', 'open the download folder'],
       ['A', 'toggle auto-accept for incoming transfers'],
       ['q / ctrl+c', 'quit'],
-      ['', ''],
-      ['File picker', ''],
+      { h: 'File picker' },
       ['space', 'select / unselect (files and whole folders)'],
       ['enter / →', 'open folder     ← / backspace: go up'],
       ['/', 'type or paste a path (drag a file onto the terminal)'],
       ['s', 'send selection (or the highlighted item)'],
-      ['', ''],
-      ['Everything is end-to-end encrypted (TLS 1.3). Check the id shown for a', ''],
-      ['peer matches what they see in their header before trusting a sender.', ''],
+      { p: '' },
+      { p: 'Everything is end-to-end encrypted (TLS 1.3). Compare the id in an' },
+      { p: "incoming prompt with the one in the sender's header before accepting." },
     ];
-    const lines = rows.map(([a, b]) =>
-      b === '' && a && !a.includes(' ') ? paint(a, { bold: true, fg: C.accent }) : paint(fit(a, 12), { bold: true }) + paint(b, { fg: b ? undefined : C.muted }),
+    const lines = rows.map((row) =>
+      Array.isArray(row)
+        ? paint(fit(row[0], 12), { bold: true }) + row[1]
+        : 'h' in row
+          ? paint(row.h, { bold: true, fg: C.accent })
+          : paint(row.p, { fg: C.muted }),
     );
+    lines.length = Math.min(lines.length, h - 2);
     return center(box({ title: 'Help', w: bw, h: lines.length + 2, lines, focused: true }), bw, w, h);
   }
 }

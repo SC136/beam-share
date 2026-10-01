@@ -1,17 +1,49 @@
 import fs from 'node:fs';
-import { Beam } from './beam.js';
-import { HELP, parseArgs, version } from './cli.js';
+import { Beam, localAddresses } from './beam.js';
+import { HELP, RELAY_HELP, parseArgs, version } from './cli.js';
+import { startRelay } from './relay.js';
+import { generateCode } from './room.js';
 import { farewell } from './ui/art.js';
 import { App } from './ui/app.js';
 import { Screen, setAscii } from './ui/term.js';
 import { formatBytes, sleep } from './util.js';
 
+/** `beam relay`: run the relay server (no UI - just a log). */
+async function runRelay(opts) {
+  const stamp = () => new Date().toTimeString().slice(0, 8);
+  let relay;
+  try {
+    relay = await startRelay({
+      port: opts.port,
+      host: opts.host,
+      token: opts.token,
+      trustProxy: opts.trustProxy,
+      log: (line) => console.log(`${stamp()}  ${line}`),
+    });
+  } catch (e) {
+    console.error(`beam relay: could not start: ${e.message}`);
+    process.exit(1);
+  }
+  const addrs = opts.host === '0.0.0.0' ? localAddresses() : [opts.host];
+  console.log('\nTell everyone to use it with:');
+  for (const a of addrs.length ? addrs : ['<this machine\'s address>']) console.log(`  beam --relay ${a}:${relay.port}`);
+  console.log(opts.token ? '\nClients must also pass --relay-token (or set BEAM_RELAY_TOKEN).' : '\nNo token set: anyone who can reach this relay can use it. Use --token on a public one.');
+  console.log('Press Ctrl+C to stop.\n');
+  const stop = async () => {
+    await Promise.race([relay.close(), sleep(2000)]);
+    process.exit(0);
+  };
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
+}
+
 export async function main(argv) {
-  const { opts, queued, peers, help, error, version: wantVersion } = parseArgs(argv);
+  const { command, opts, queued, peers, help, error, version: wantVersion } = parseArgs(argv);
   if (error) {
-    console.error(`beam: ${error}\nTry: beam --help`);
+    console.error(`beam: ${error}\nTry: beam ${command === 'relay' ? 'relay ' : ''}--help`);
     process.exit(2);
   }
+  if (command === 'relay') return help ? void process.stdout.write(RELAY_HELP) : runRelay(opts);
   if (help) return void process.stdout.write(HELP);
   if (wantVersion) return void console.log(version());
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
@@ -33,12 +65,19 @@ export async function main(argv) {
     configDir: opts.config,
     autoAccept: opts.autoAccept,
     discovery: !opts.noDiscovery,
+    relay: opts.relay,
+    relayToken: opts.relayToken,
   });
   try {
     await beam.start();
   } catch (e) {
     console.error(`beam: could not start: ${e.message}`);
     process.exit(1);
+  }
+  if (opts.room && !beam.relayUrl) {
+    await beam.stop();
+    console.error('beam: --room needs a relay server - add --relay <address> (see "beam relay --help").');
+    process.exit(2);
   }
 
   const app = new App(beam, { startDir: process.cwd(), queued });
@@ -89,6 +128,14 @@ export async function main(argv) {
   screen.enter({ onKey: (s, k) => app.handleKey(s, k), onResize: draw });
   for (const p of peers) {
     beam.addPeer(p).catch((e) => app.flash(`Couldn't add ${p}: ${e.message}`, 'bad', 6000));
+  }
+  if (opts.room) {
+    const created = opts.room === 'new';
+    const code = created ? generateCode() : opts.room;
+    beam.joinRoom(code).then(
+      () => app.flash(created ? `Room created - the code is ${code} (press r to see it again)` : 'Joined the room', 'ok', created ? 60_000 : 5000),
+      (e) => app.flash(`Couldn't join the room: ${e.message}`, 'bad', 10_000),
+    );
   }
   draw();
 }

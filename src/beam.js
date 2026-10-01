@@ -11,6 +11,9 @@ import { Discovery, DEFAULT_DISCOVERY_PORT } from './discovery.js';
 import { loadOrCreateIdentity, defaultConfigDir } from './identity.js';
 import { CHUNK, MAX_FILES, ProtocolError, Reader, VERSION, write, writeFrame } from './protocol.js';
 import { numbered, resolveInside, sanitizeRelPath } from './safepath.js';
+import {
+  RoomClient, bindMac, codeStrength, deriveRoomKeys, macEquals, normalizeCode, normalizeRelayUrl, randomMemberId,
+} from './room.js';
 import { scanPaths } from './scan.js';
 import { BeamError, CancelledError, clean, sha256hex, sleep } from './util.js';
 
@@ -19,6 +22,9 @@ const OFFER_TIMEOUT_MS = 120_000;
 const MAX_PENDING_OFFERS = 20;
 const PEER_TTL_MS = 8000;
 const MANUAL_PEER_TTL_MS = 20_000;
+const MAX_ROOM_PIPES = 50;
+const BIND_FAILED =
+  'could not verify the room code with that device - they may be using a different code, or the relay is tampering with the connection';
 
 // Virtual adapters (VMs, containers, VPNs) are listed last so the address we show
 // first is the one another device on the LAN can actually reach.
@@ -97,6 +103,9 @@ export class Beam extends EventEmitter {
    * @param {string} [opts.configDir]     where the identity is stored
    * @param {boolean} [opts.autoAccept]   accept every incoming offer without asking
    * @param {boolean} [opts.discovery]    set false to rely on manual peers only
+   * @param {string} [opts.relay]         relay server for internet rooms (ws://, wss:// or host[:port])
+   * @param {string} [opts.relayToken]    token the relay requires, if any (or set BEAM_RELAY_TOKEN)
+   * @param {number} [opts.kdfCost]       scrypt cost for room codes (tests lower it)
    */
   constructor(opts = {}) {
     super();
@@ -107,7 +116,11 @@ export class Beam extends EventEmitter {
     this.configDir = opts.configDir || defaultConfigDir();
     this.autoAccept = !!opts.autoAccept;
     this.useDiscovery = opts.discovery !== false;
+    this.relayUrl = opts.relay ? normalizeRelayUrl(opts.relay) : null;
+    this.relayToken = opts.relayToken ?? process.env.BEAM_RELAY_TOKEN ?? null;
+    this._kdfCost = opts.kdfCost;
 
+    this.room = null; // {code, url, roomId, authKey, mid, state, error, client, ...} while in an internet room
     this.identity = null;
     this.port = 0;
     this.discoveryError = null;
@@ -131,17 +144,8 @@ export class Beam extends EventEmitter {
     this.identity = loadOrCreateIdentity(this.configDir);
     await fs.mkdir(this.downloadDir, { recursive: true });
 
-    this._server = tls.createServer(
-      {
-        key: this.identity.key,
-        cert: this.identity.cert,
-        requestCert: true, // mutual TLS: we want the client's certificate fingerprint too
-        rejectUnauthorized: false, // identity = fingerprint, not a CA chain
-        minVersion: 'TLSv1.3',
-        handshakeTimeout: 10_000,
-      },
-      (sock) => this._onConnection(sock),
-    );
+    await this._loadSettings();
+    this._server = tls.createServer(this._tlsServerOptions(), (sock) => this._onConnection(sock));
     this._server.maxConnections = 100;
     this._server.on('tlsClientError', () => {});
     this._server.on('error', (e) => this.emit('warning', `server: ${e.message}`));
@@ -162,7 +166,9 @@ export class Beam extends EventEmitter {
       this._discovery.on('bye', (id) => {
         const p = this._peers.get(id);
         if (p && !p.manual) {
-          this._peers.delete(id);
+          p.address = null;
+          p.port = null;
+          if (!p.via) this._peers.delete(id);
           this._touch();
         }
       });
@@ -187,6 +193,27 @@ export class Beam extends EventEmitter {
     this._ticker.unref();
   }
 
+  _tlsServerOptions() {
+    return {
+      key: this.identity.key,
+      cert: this.identity.cert,
+      requestCert: true, // mutual TLS: we want the client's certificate fingerprint too
+      rejectUnauthorized: false, // identity = fingerprint, not a CA chain
+      minVersion: 'TLSv1.3',
+      handshakeTimeout: 10_000,
+    };
+  }
+
+  _tlsClientOptions() {
+    return {
+      key: this.identity.key,
+      cert: this.identity.cert,
+      rejectUnauthorized: false,
+      minVersion: 'TLSv1.3',
+      checkServerIdentity: () => undefined,
+    };
+  }
+
   _listen(port) {
     return new Promise((resolve, reject) => {
       const onError = (e) => reject(e);
@@ -202,6 +229,7 @@ export class Beam extends EventEmitter {
     this._stopped = true;
     clearInterval(this._ticker);
     clearTimeout(this._touchTimer);
+    this.leaveRoom();
     for (const t of this._transfers.values()) t.abort?.();
     for (const { decide } of this._pending.values()) decide({ ok: false, reason: 'shutting down' });
     await this._discovery?.stop();
@@ -220,6 +248,8 @@ export class Beam extends EventEmitter {
       addresses: localAddresses(),
       downloadDir: this.downloadDir,
       discovery: !!this._discovery,
+      relay: this.relayUrl,
+      room: this.roomInfo(),
     };
   }
 
@@ -235,15 +265,39 @@ export class Beam extends EventEmitter {
     return this._peers.get(id);
   }
 
+  // A peer can be reachable on the LAN (address/port), through a relay room (via), or both.
+  // `address` is null for a peer we only know through a room.
+  _newPeer(id, name) {
+    const p = { id, name, address: null, port: null, lastSeen: 0, manual: false, online: true, via: null };
+    this._peers.set(id, p);
+    return p;
+  }
+
   _seen({ id, name, address, port }, manual = false) {
     if (id === this.fingerprint) return;
-    let p = this._peers.get(id);
-    if (!p) {
-      p = { id, name, address, port, lastSeen: 0, manual: false, online: true };
-      this._peers.set(id, p);
-    }
+    const p = this._peers.get(id) ?? this._newPeer(id, name);
     Object.assign(p, { name, address, port, lastSeen: Date.now(), online: true });
     if (manual) p.manual = true;
+    this._touch();
+  }
+
+  _seenVia({ id, name, mid }) {
+    if (id === this.fingerprint) return;
+    const p = this._peers.get(id) ?? this._newPeer(id, name);
+    p.name = name;
+    p.via = { mid };
+    p.online = true;
+    this._touch();
+  }
+
+  /** Forget the relay route to one member (or all of them); drop peers nothing else reaches. */
+  _dropVia(mid) {
+    for (const [id, p] of this._peers) {
+      if (!p.via || (mid && p.via.mid !== mid)) continue;
+      p.via = null;
+      if (!p.address) this._peers.delete(id);
+      else if (p.manual) p.online = Date.now() - p.lastSeen < MANUAL_PEER_TTL_MS;
+    }
     this._touch();
   }
 
@@ -252,13 +306,15 @@ export class Beam extends EventEmitter {
     let changed = false;
     for (const [id, p] of this._peers) {
       if (p.manual) {
-        const online = now - p.lastSeen < MANUAL_PEER_TTL_MS;
+        const online = !!p.via || now - p.lastSeen < MANUAL_PEER_TTL_MS;
         if (online !== p.online) {
           p.online = online;
           changed = true;
         }
-      } else if (now - p.lastSeen > PEER_TTL_MS) {
-        this._peers.delete(id);
+      } else if (p.address && now - p.lastSeen > PEER_TTL_MS) {
+        p.address = null; // gone from the LAN; keep the peer only if a room still reaches it
+        p.port = null;
+        if (!p.via) this._peers.delete(id);
         changed = true;
       }
     }
@@ -267,7 +323,7 @@ export class Beam extends EventEmitter {
 
   _refreshManualPeers() {
     for (const p of this._peers.values()) {
-      if (p.manual) this._hello(p.address, p.port, p.id).then((r) => r && this._seen({ ...p, name: r.name }, true), () => {});
+      if (p.manual && p.address) this._hello(p.address, p.port, p.id).then((r) => r && this._seen({ ...p, name: r.name }, true), () => {});
     }
   }
 
@@ -281,12 +337,16 @@ export class Beam extends EventEmitter {
   }
 
   async _hello(host, port, expectFp) {
-    const ctl = new AbortController();
-    const { sock, fp } = await this._connect(host, port, expectFp, ctl.signal);
+    return this._helloOn(await this._connect(host, port, expectFp));
+  }
+
+  /** Ask the device on the other end of an open connection for its name; always closes the connection. */
+  async _helloOn({ sock, fp, bind }) {
     try {
       const reader = new Reader(sock);
       const timer = setTimeout(() => reader.abort(new BeamError('timed out')), 5000);
       try {
+        if (bind) await this._bindAsDialer(sock, reader, bind);
         await writeFrame(sock, { t: 'hello', v: VERSION, name: this.name });
         const reply = await reader.readFrame();
         if (reply.t !== 'hello') throw new ProtocolError('unexpected reply');
@@ -297,6 +357,187 @@ export class Beam extends EventEmitter {
     } finally {
       sock.destroy();
     }
+  }
+
+  // ------------------------------------------------------- internet rooms
+
+  async _loadSettings() {
+    try {
+      const saved = JSON.parse(await fs.readFile(path.join(this.configDir, 'settings.json'), 'utf8'));
+      if (!this.relayUrl && typeof saved.relay === 'string') this.relayUrl = normalizeRelayUrl(saved.relay);
+    } catch {
+      /* no settings yet, or unreadable: nothing to restore */
+    }
+  }
+
+  /** Choose the relay server for internet rooms; remembered next to the identity. */
+  async setRelay(input) {
+    const url = normalizeRelayUrl(input);
+    if (!url) throw new BeamError('enter the relay address, e.g. relay.example.com or 203.0.113.5:7979');
+    this.relayUrl = url;
+    try {
+      const file = path.join(this.configDir, 'settings.json');
+      let saved = {};
+      try {
+        saved = JSON.parse(await fs.readFile(file, 'utf8'));
+      } catch {
+        /* first time */
+      }
+      await fs.mkdir(this.configDir, { recursive: true });
+      await fs.writeFile(file, JSON.stringify({ ...saved, relay: url }));
+    } catch {
+      /* not being able to save the choice is not fatal */
+    }
+    this._touch();
+    return url;
+  }
+
+  /**
+   * Join an internet room (everyone who enters the same code ends up in the same room).
+   * Resolves once connected; after that it reconnects by itself if the relay connection drops.
+   */
+  async joinRoom(input) {
+    const code = normalizeCode(input);
+    if (!this.relayUrl) throw new BeamError('no relay server set yet');
+    if (this.room) this.leaveRoom();
+    const keys = await deriveRoomKeys(code, this._kdfCost);
+    const room = {
+      code,
+      url: this.relayUrl,
+      ...keys,
+      mid: '',
+      state: 'connecting',
+      error: null,
+      client: null,
+      stopped: false,
+      retry: null,
+      retryAt: null,
+      attempt: 0,
+      pipes: new Set(),
+      strength: codeStrength(code),
+    };
+    this.room = room;
+    this._touch();
+    try {
+      await this._roomConnect(room);
+    } catch (e) {
+      room.stopped = true;
+      if (this.room === room) this.room = null;
+      this._touch();
+      throw e;
+    }
+  }
+
+  leaveRoom() {
+    const room = this.room;
+    if (!room) return;
+    room.stopped = true;
+    clearTimeout(room.retry);
+    room.client?.close();
+    for (const pipe of room.pipes) pipe.destroy();
+    this.room = null;
+    this._dropVia();
+    this._touch();
+  }
+
+  /** What the UI shows about the room (never the keys). */
+  roomInfo() {
+    const r = this.room;
+    if (!r) return null;
+    return {
+      state: r.state,
+      code: r.code,
+      url: r.url,
+      error: r.error,
+      strength: r.strength,
+      retryAt: r.retryAt,
+      members: [...this._peers.values()].filter((p) => p.via).length,
+    };
+  }
+
+  async _roomConnect(room) {
+    room.mid = randomMemberId(); // a fresh id every time: the relay may still hold the previous one
+    room.state = 'connecting';
+    room.retryAt = null;
+    this._touch();
+    const client = new RoomClient({ url: room.url, roomId: room.roomId, mid: room.mid, token: this.relayToken });
+    client.on('incoming', (m) => this._roomIncoming(room, client, m));
+    client.on('peer-left', (mid) => this._dropVia(mid));
+    client.once('close', () => this._roomClosed(room, client));
+    const members = await client.connect();
+    if (room.stopped) return client.close();
+    room.client = client;
+    room.state = 'online';
+    room.error = null;
+    room.attempt = 0;
+    // Members already here learn about us when we say hello to them; later joiners say hello to us.
+    for (const mid of members) this._roomProbe(room, client, mid);
+    this._touch();
+  }
+
+  _roomClosed(room, client) {
+    if (room.stopped || room.client !== client) return;
+    room.client = null;
+    room.state = 'offline';
+    this._dropVia();
+    this._scheduleReconnect(room);
+  }
+
+  _scheduleReconnect(room) {
+    if (room.stopped) return;
+    const delay = Math.min(30_000, 1000 * 2 ** Math.min(room.attempt++, 5));
+    room.retryAt = Date.now() + delay;
+    this._touch();
+    room.retry = setTimeout(async () => {
+      room.retry = null;
+      if (room.stopped) return;
+      try {
+        await this._roomConnect(room);
+      } catch (e) {
+        room.error = e.message;
+        room.state = 'offline';
+        this._scheduleReconnect(room);
+      }
+    }, delay);
+    room.retry.unref?.();
+  }
+
+  /** The relay announced a device wants to talk to us: accept the pipe and run the TLS server side over it. */
+  async _roomIncoming(room, client, { pipe, from }) {
+    if (room.stopped || room.client !== client || room.pipes.size >= MAX_ROOM_PIPES) return;
+    let duplex;
+    try {
+      duplex = await client.accept(pipe);
+    } catch {
+      return;
+    }
+    room.pipes.add(duplex);
+    duplex.once('close', () => room.pipes.delete(duplex));
+    const srv = tls.createServer(this._tlsServerOptions(), (sock) =>
+      this._onConnection(sock, { via: { mid: from }, bind: room.authKey }),
+    );
+    srv.on('tlsClientError', () => duplex.destroy());
+    srv.emit('connection', duplex);
+  }
+
+  /** Say hello to a member who was already in the room, to learn their name and identity. */
+  _roomProbe(room, client, mid) {
+    (async () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (room.stopped || room.client !== client) return;
+        try {
+          const r = await this._helloOn(await this._connectVia(room, mid));
+          if (room.client === client) this._seenVia({ id: r.fingerprint, name: r.name, mid });
+          return;
+        } catch (e) {
+          if (e?.message === BIND_FAILED) {
+            this.emit('warning', 'a device in the room failed the room-code check and was ignored');
+            return;
+          }
+          await sleep(1500);
+        }
+      }
+    })();
   }
 
   // ------------------------------------------------------------ transfers
@@ -391,7 +632,7 @@ export class Beam extends EventEmitter {
       peerName: peer.name,
       label: paths.length === 1 ? path.basename(paths[0]) || paths[0] : `${paths.length} items`,
     });
-    this._runSend(t, { ...peer }, paths).catch((err) => this._finish(t, 'failed', err.message));
+    this._runSend(t, { ...peer, via: peer.via && { ...peer.via } }, paths).catch((err) => this._finish(t, 'failed', err.message));
     return t;
   }
 
@@ -409,7 +650,8 @@ export class Beam extends EventEmitter {
 
       t.status = 'waiting';
       this._touch();
-      ({ sock } = await this._connect(peer.address, peer.port, peer.id, ac.signal));
+      let bind;
+      ({ sock, bind } = await this._connectPeer(peer, ac.signal));
       this._sockets.add(sock);
       sock.on('close', () => this._sockets.delete(sock));
       const reader = new Reader(sock);
@@ -417,6 +659,7 @@ export class Beam extends EventEmitter {
         reader.abort(new CancelledError());
         sock.destroy();
       });
+      if (bind) await this._bindAsDialer(sock, reader, bind); // relay route: prove we both know the room code
 
       await writeFrame(sock, {
         t: 'offer',
@@ -492,17 +735,9 @@ export class Beam extends EventEmitter {
     }
   }
 
-  _connect(host, port, expectFp, signal) {
+  /** Finish a TLS client handshake: enforce the announced identity and a deadline. */
+  _handshake(sock, expectFp, signal, ms = 6000) {
     return new Promise((resolve, reject) => {
-      const sock = tls.connect({
-        host,
-        port,
-        key: this.identity.key,
-        cert: this.identity.cert,
-        rejectUnauthorized: false,
-        minVersion: 'TLSv1.3',
-        checkServerIdentity: () => undefined,
-      });
       let settled = false;
       const fail = (e) => {
         if (settled) return;
@@ -511,7 +746,7 @@ export class Beam extends EventEmitter {
         sock.destroy();
         reject(friendlyNetError(e));
       };
-      const timer = setTimeout(() => fail(new BeamError('connection timed out')), 6000);
+      const timer = setTimeout(() => fail(new BeamError('connection timed out')), ms);
       sock.once('error', fail);
       if (signal?.aborted) return fail(new CancelledError());
       signal?.addEventListener('abort', () => fail(new CancelledError()), { once: true });
@@ -532,9 +767,55 @@ export class Beam extends EventEmitter {
     });
   }
 
+  /** Direct connection over the LAN / by address. */
+  _connect(host, port, expectFp, signal) {
+    return this._handshake(tls.connect({ host, port, ...this._tlsClientOptions() }), expectFp, signal);
+  }
+
+  /** Connection through the relay: ask for a pipe to the member, then run TLS over it. */
+  async _connectVia(room, mid, expectFp, signal) {
+    if (room.state !== 'online' || !room.client) throw new BeamError('not connected to the internet room right now');
+    const pipe = await room.client.dial(mid, signal);
+    room.pipes.add(pipe);
+    pipe.once('close', () => room.pipes.delete(pipe));
+    try {
+      const conn = await this._handshake(tls.connect({ socket: pipe, ...this._tlsClientOptions() }), expectFp, signal, 10_000);
+      return { ...conn, bind: room.authKey };
+    } catch (e) {
+      pipe.destroy();
+      throw e;
+    }
+  }
+
+  /** Reach a peer: directly if it is on the LAN, otherwise (or if that fails) through the room. */
+  async _connectPeer(peer, signal) {
+    if (peer.address) {
+      try {
+        return await this._connect(peer.address, peer.port, peer.id, signal);
+      } catch (e) {
+        if (!peer.via || signal?.aborted || e instanceof CancelledError) throw e;
+      }
+    }
+    if (peer.via && this.room) return this._connectVia(this.room, peer.via.mid, peer.id, signal);
+    throw new BeamError('that device is not reachable right now');
+  }
+
+  async _bindAsDialer(sock, reader, key) {
+    await writeFrame(sock, { t: 'bind', mac: bindMac(sock, key, 'dial') });
+    const r = await reader.readFrame();
+    if (r.t !== 'bind' || !macEquals(r.mac, bindMac(sock, key, 'accept'))) throw new BeamError(BIND_FAILED);
+  }
+
+  async _bindAsAcceptor(sock, reader, key) {
+    const r = await reader.readFrame();
+    if (r.t !== 'bind' || !macEquals(r.mac, bindMac(sock, key, 'dial'))) throw new BeamError(BIND_FAILED);
+    await writeFrame(sock, { t: 'bind', mac: bindMac(sock, key, 'accept') });
+  }
+
   // ------------------------------------------------------------- receiving
 
-  async _onConnection(sock) {
+  /** @param ctx {{via?: {mid: string}, bind?: Buffer}} set for connections that arrived through a relay room */
+  async _onConnection(sock, ctx = {}) {
     this._sockets.add(sock);
     sock.on('close', () => this._sockets.delete(sock));
     sock.on('error', () => {});
@@ -544,19 +825,25 @@ export class Beam extends EventEmitter {
     const reader = new Reader(sock);
     const timer = setTimeout(() => reader.abort(new BeamError('timed out')), 10_000);
     try {
+      if (ctx.bind) await this._bindAsAcceptor(sock, reader, ctx.bind);
       const first = await reader.readFrame();
       clearTimeout(timer);
       reader.aborted = null;
+      // Whoever reaches us through the room has proven they know the code, so they're a peer too.
+      const register = () => ctx.via && this._seenVia({ id: fp, name: clean(first.name, 64) || 'unnamed', mid: ctx.via.mid });
       if (first.t === 'hello') {
+        register();
         await writeFrame(sock, { t: 'hello', v: VERSION, name: this.name });
         sock.end();
       } else if (first.t === 'offer') {
-        await this._handleOffer(sock, reader, fp, first);
+        register();
+        await this._handleOffer(sock, reader, fp, first, ctx);
       } else {
         sock.destroy();
       }
-    } catch {
+    } catch (e) {
       clearTimeout(timer);
+      if (ctx.bind && e?.message === BIND_FAILED) this.emit('warning', 'a device in the room failed the room-code check and was refused');
       sock.destroy();
     }
   }
@@ -596,7 +883,7 @@ export class Beam extends EventEmitter {
     return { entries, total, fileCount, groups: [...groups.values()] };
   }
 
-  async _handleOffer(sock, reader, fp, msg) {
+  async _handleOffer(sock, reader, fp, msg, ctx = {}) {
     const reject = async (reason) => {
       try {
         await writeFrame(sock, { t: 'reply', ok: false, reason });
@@ -614,7 +901,7 @@ export class Beam extends EventEmitter {
     if (this._pending.size >= MAX_PENDING_OFFERS) return reject('receiver is busy');
 
     const known = this._peers.get(fp);
-    const remoteAddr = (sock.remoteAddress || '').replace(/^::ffff:/, '');
+    const remoteAddr = ctx.via ? 'via relay' : (sock.remoteAddress || '').replace(/^::ffff:/, '');
     const offer = {
       id: this._nextId++,
       peerId: fp,

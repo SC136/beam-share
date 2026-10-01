@@ -12,10 +12,11 @@ export function version() {
 
 export const HELP = `${plainBrand().join('\n')}
 
-beam - send files to devices on your local network, from the terminal.
+beam - send files to devices on your local network, or over the internet, from the terminal.
 
 Usage:
   npx beam-share [options] [files or folders to send...]
+  npx beam-share relay [options]        run a relay server for internet rooms
 
 Run it on two devices on the same network; they find each other automatically.
 Pick a peer, choose files, and the other side accepts or declines.
@@ -33,8 +34,34 @@ Options:
   -h, --help               show this help
   -v, --version            show the version
 
+Over the internet (needs a relay server somewhere - see "beam relay --help"):
+      --relay <address>    relay to use, e.g. relay.example.com or 203.0.113.5:7979
+      --relay-token <t>    token the relay asks for, if it has one (or set BEAM_RELAY_TOKEN)
+      --room <code|new>    join the room with this code at startup, or "new" to create one
+                           (you can also press r inside the app)
+
 Files or folders given on the command line are preselected when you choose a peer.
 Press ? inside the app for the key bindings.
+`;
+
+export const RELAY_HELP = `beam relay - the server that lets devices on different networks find each other.
+
+Usage:
+  npx beam-share relay [options]
+
+It only forwards encrypted bytes: it can't read file names or contents, and it never
+learns the room codes. Run it on any machine that can be reached from the internet
+(a small VPS, a Raspberry Pi with a port forward, or any host that runs Node and exposes
+an HTTP/WebSocket port). Everyone then uses it with: beam --relay <this address>
+
+Options:
+  -p, --port <port>     port to listen on (default: $PORT, or 7979)
+      --host <address>  address to listen on (default: 0.0.0.0)
+      --token <secret>  require this token from clients (default: $BEAM_RELAY_TOKEN, or none)
+      --trust-proxy     take client IPs from X-Forwarded-For (use behind a hosting platform's proxy)
+  -h, --help            show this help
+
+Without --token anyone who finds the relay can use its bandwidth. Set one for a public relay.
 `;
 
 const VALUE_FLAGS = {
@@ -44,6 +71,9 @@ const VALUE_FLAGS = {
   '--peer': 'peer',
   '--discovery-port': 'discoveryPort',
   '--config': 'config',
+  '--relay': 'relay',
+  '--relay-token': 'relayToken',
+  '--room': 'room',
 };
 const BOOL_FLAGS = {
   '--auto-accept': 'autoAccept',
@@ -53,26 +83,57 @@ const BOOL_FLAGS = {
   '-v': 'version', '--version': 'version',
 };
 
+const RELAY_VALUE_FLAGS = { '-p': 'port', '--port': 'port', '--host': 'host', '--token': 'token' };
+const RELAY_BOOL_FLAGS = { '--trust-proxy': 'trustProxy', '-h': 'help', '--help': 'help' };
+
 function port(name, v) {
   const n = Number(v);
   if (!Number.isInteger(n) || n < 0 || n > 65535) throw new Error(`${name} must be a port number (0-65535), got "${v}"`);
   return n;
 }
 
-/** @returns {{opts: object, queued: string[], peers: string[], help?: boolean, version?: boolean, error?: string}} */
+/** Split "--flag=value" into [flag, value]. */
+function splitInline(arg) {
+  const eq = arg.startsWith('--') ? arg.indexOf('=') : -1;
+  return eq > 0 ? [arg.slice(0, eq), arg.slice(eq + 1)] : [arg, undefined];
+}
+
+function parseRelayArgs(argv) {
+  const opts = { port: process.env.PORT ? Number(process.env.PORT) : 7979, host: '0.0.0.0', token: process.env.BEAM_RELAY_TOKEN || null };
+  try {
+    for (let i = 0; i < argv.length; i++) {
+      const [arg, inline] = splitInline(argv[i]);
+      if (arg in RELAY_VALUE_FLAGS) {
+        const v = inline ?? argv[++i];
+        if (v === undefined) throw new Error(`${arg} needs a value`);
+        const key = RELAY_VALUE_FLAGS[arg];
+        opts[key] = key === 'port' ? port('--port', v) : v;
+      } else if (arg in RELAY_BOOL_FLAGS) {
+        opts[RELAY_BOOL_FLAGS[arg]] = true;
+      } else {
+        throw new Error(`unknown relay option ${arg}`);
+      }
+    }
+  } catch (e) {
+    return { command: 'relay', opts, error: e.message };
+  }
+  if (!Number.isInteger(opts.port) || opts.port < 0 || opts.port > 65535) {
+    return { command: 'relay', opts, error: `PORT must be a port number (0-65535), got "${process.env.PORT}"` };
+  }
+  return { command: 'relay', opts, help: opts.help };
+}
+
+/**
+ * @returns {{command: 'app'|'relay', opts: object, queued?: string[], peers?: string[], help?: boolean, version?: boolean, error?: string}}
+ */
 export function parseArgs(argv) {
+  if (argv[0] === 'relay') return parseRelayArgs(argv.slice(1));
   const opts = {};
   const queued = [];
   const peers = [];
   try {
     for (let i = 0; i < argv.length; i++) {
-      let arg = argv[i];
-      let inline;
-      const eq = arg.startsWith('--') ? arg.indexOf('=') : -1;
-      if (eq > 0) {
-        inline = arg.slice(eq + 1);
-        arg = arg.slice(0, eq);
-      }
+      const [arg, inline] = splitInline(argv[i]);
       if (arg === '--') {
         queued.push(...argv.slice(i + 1).map((p) => path.resolve(p)));
         break;
@@ -94,7 +155,7 @@ export function parseArgs(argv) {
       }
     }
   } catch (e) {
-    return { opts, queued, peers, error: e.message };
+    return { command: 'app', opts, queued, peers, error: e.message };
   }
-  return { opts, queued, peers, help: opts.help, version: opts.version };
+  return { command: 'app', opts, queued, peers, help: opts.help, version: opts.version };
 }
