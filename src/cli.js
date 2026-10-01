@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { LOGO } from './ui/art.js';
+import { plainBrand } from './ui/art.js';
 
 export function version() {
   try {
@@ -10,7 +10,7 @@ export function version() {
   }
 }
 
-export const HELP = `${LOGO.join('\n')}
+export const HELP = `${plainBrand().join('\n')}
 
 beam - send files to devices on your local network, from the terminal.
 

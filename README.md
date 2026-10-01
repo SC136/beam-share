@@ -1,9 +1,9 @@
 ```
- _
-| |__   ___  __ _ _ __ ___
-| '_ \ / _ \/ _` | '_ ` _ \
-| |_) |  __/ (_| | | | | | |
-|_.__/ \___|\__,_|_| |_| |_|
+            _
+           | |__   ___  __ _ _ __ ___
+ /\_/\     | '_ \ / _ \/ _` | '_ ` _ \
+( o.o )    | |_) |  __/ (_| | | | | | |
+ > ^ <-    |_.__/ \___|\__,_|_| |_| |_|
 ```
 
 # beam
@@ -74,6 +74,22 @@ Received files go to `~/Downloads/beam` (change with `--dir`). Nothing is ever o
     --config <folder>     where this device's identity is stored
     --ascii               plain ASCII instead of box-drawing characters
 ```
+
+## The cat
+
+A small cat lives in the header and reacts to what's going on:
+
+| Face | Meaning |
+| --- | --- |
+| `=<.<=` `=>.>=` | looking around - no peers found yet |
+| `=o.o=` | content (blinks now and then, tail wags in the big picture) |
+| `=O.O=` | startled - an incoming transfer is waiting for you |
+| `=^w^=` | purring - a transfer is running |
+| `=^.^=` | happy - one just finished (and it says "meow!") |
+| `=;.;=` | sad - one just failed |
+| `=-.-=` | asleep - nobody has touched the keyboard for two minutes |
+
+The big cat sits next to the logo when the Transfers panel is empty, and waves goodbye when you quit.
 
 ## How it works
 

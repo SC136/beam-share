@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { Beam } from './beam.js';
 import { HELP, parseArgs, version } from './cli.js';
+import { farewell } from './ui/art.js';
 import { App } from './ui/app.js';
 import { Screen, setAscii } from './ui/term.js';
 import { formatBytes, sleep } from './util.js';
@@ -62,10 +63,13 @@ export async function main(argv) {
     app.detach();
     const received = beam.transfers().filter((t) => t.dir === 'recv' && t.status === 'done');
     await Promise.race([beam.stop().catch(() => {}), sleep(2000)]);
+    let summary = '';
     if (received.length) {
       const total = received.reduce((n, t) => n + t.total, 0);
-      console.log(`Received ${received.length} transfer${received.length > 1 ? 's' : ''} (${formatBytes(total)}) in ${beam.downloadDir}`);
+      summary = `received ${formatBytes(total)} in ${received.length} transfer${received.length > 1 ? 's' : ''}`;
     }
+    console.log(['', ...farewell(summary)].join('\n'));
+    if (received.length) console.log(`  saved in ${beam.downloadDir}`);
     process.exit(code);
   };
   app.onQuit = () => quit(0);

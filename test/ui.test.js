@@ -106,7 +106,7 @@ test('main screen: header, empty-state hint, and exact frame size at many termin
   const beam = await makeBeam('my-laptop');
   const app = makeApp(beam);
   const s = screen(app);
-  assert.match(s, /beam\s+my-laptop/);
+  assert.match(s, /beam\s+=\S{3}=\s+my-laptop/, 'badge, cat face, then the device name');
   assert.match(s, /Looking for devices on your network/);
   assert.match(s, /npx beam-share/);
   assert.match(s, /No transfers yet/);

@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import os from 'node:os';
 import { isActive } from '../beam.js';
 import { formatBytes, formatDuration, formatRate, shortFp } from '../util.js';
-import { LOGO_HEIGHT, LOGO_WIDTH, TAGLINE, linkLine, logoLines } from './art.js';
+import { CAT_WIDTH, LOGO_HEIGHT, LOGO_WIDTH, TAGLINE, brandLines, catColor, catFace, catLines, linkLine } from './art.js';
 import { TextInput } from './input.js';
 import { FilePicker } from './picker.js';
 import { C, G, SPINNER, box, center, fit, padAnsi, padStart, paint, progressBar, stripAnsi, strWidth } from './term.js';
@@ -43,6 +43,8 @@ export class App {
     this.opener = opener;
     this.now = now;
     this.startedAt = now();
+    this.lastInputAt = this.startedAt; // the cat falls asleep if nobody touches the keyboard
+    this._announced = new Set(beam.transfers().filter((t) => !isActive(t)).map((t) => t.id));
     this.lastDir = startDir;
     this.queued = queued;
 
@@ -61,7 +63,10 @@ export class App {
     this.onChange = () => {};
     this.onQuit = () => {};
     this._listeners = {
-      change: () => this.onChange(),
+      change: () => {
+        this._announce();
+        this.onChange();
+      },
       offer: (o) => {
         this.offers.push(o);
         this.onChange();
@@ -123,7 +128,36 @@ export class App {
 
   // ----------------------------------------------------------------- input
 
+  /** What the cat is feeling, derived from what's going on. */
+  _mood() {
+    const now = this.now();
+    if (this.offers.length) return 'alert';
+    const transfers = this.beam.transfers();
+    if (transfers.some(isActive)) return 'busy';
+    const last = transfers.filter((t) => t.endedAt).sort((a, b) => b.endedAt - a.endedAt)[0];
+    if (last && now - last.endedAt < 8000) {
+      if (last.status === 'done') return 'happy';
+      if (last.status === 'failed') return 'sad';
+    }
+    if (now - this.lastInputAt > 120_000) return 'sleep';
+    return this.beam.peers().length === 0 ? 'search' : 'idle';
+  }
+
+  /** The cat reports when a transfer finishes. */
+  _announce() {
+    for (const t of this.beam.transfers()) {
+      if (this._announced.has(t.id) || isActive(t)) continue;
+      this._announced.add(t.id);
+      if (t.status === 'done') {
+        this.flash(`meow! ${t.label} ${t.dir === 'send' ? 'delivered to' : 'received from'} ${t.peerName}`, 'ok');
+      } else if (t.status === 'failed') {
+        this.flash(`oh no - ${t.label}: ${t.error ?? 'failed'}`, 'bad', 6000);
+      }
+    }
+  }
+
   handleKey(str, k = {}) {
+    this.lastInputAt = this.now();
     if (k.ctrl && k.name === 'c') return this.requestQuit();
     if (this.mode === 'picker') this.picker.handleKey(str, k);
     else if (this.mode === 'addpeer') this._addPeerKey(str, k);
@@ -288,9 +322,11 @@ export class App {
     // Most important first: if the line is too long, it's the tail that gets clipped.
     // The auto-accept badge is a safety signal, so the name gives way to it.
     const badge = this.beam.autoAccept ? '  ' + paint(' AUTO-ACCEPT ', { bold: true, fg: 16, bg: C.warn }) : '';
-    const nameRoom = Math.max(6, w - 8 - (badge ? 15 : 0));
+    const nameRoom = Math.max(6, w - 15 - (badge ? 15 : 0));
     const name = fit(info.name, Math.min(strWidth(info.name), nameRoom));
-    let s = paint(' beam ', { bold: true, fg: 16, bg: C.accent }) + '  ' + paint(name, { bold: true }) + badge;
+    const mood = this._mood();
+    const face = paint(catFace(mood, this.now()), { fg: catColor(mood), bold: true });
+    let s = paint(' beam ', { bold: true, fg: 16, bg: C.accent }) + ' ' + face + '  ' + paint(name, { bold: true }) + badge;
     return s + paint(`  ${addr}  id ${shortFp(info.fingerprint ?? '')}  ${G.down} ${tildify(info.downloadDir)}`, { fg: C.muted });
   }
 
@@ -388,7 +424,7 @@ export class App {
     if (transfers.length === 0) {
       // The wordmark only appears when there's room for it plus the three hint lines.
       if (h - 2 >= LOGO_HEIGHT + 5 && iw >= LOGO_WIDTH + 2) {
-        lines.push(...logoLines(iw));
+        lines.push(...brandLines(iw, this._mood(), this.now()));
         const pad = Math.max(0, Math.floor((iw - TAGLINE.length) / 2));
         lines.push(' '.repeat(pad) + paint(TAGLINE, { fg: C.muted }), '');
       }
@@ -471,6 +507,7 @@ export class App {
     const iw = bw - 4;
     const lines = [];
     lines.push(paint(o.peerName, { bold: true, fg: C.accent }) + paint(' wants to send you:', { bold: true }));
+    const catRoom = iw >= 58; // the cat sits top-right of the prompt, ears up
     lines.push(
       paint(`${o.address} - id ${shortFp(o.fingerprint)}`, { fg: C.muted }) +
         (o.known ? '' : paint('  (not in your peer list)', { fg: C.warn })),
@@ -491,6 +528,10 @@ export class App {
         paint(' n ', { bold: true, fg: 16, bg: C.bad }) + ' Decline' +
         (more ? paint(`        (${more} more waiting)`, { fg: C.muted }) : ''),
     );
+    if (catRoom) {
+      const cat = catLines('alert', this.now());
+      for (let i = 0; i < cat.length; i++) lines[i] = padAnsi(lines[i], iw - CAT_WIDTH - 1) + ' ' + cat[i];
+    }
     const boxLines = box({ title: 'Incoming transfer', w: bw, h: lines.length + 2, lines, focused: true });
     return center(boxLines, bw, w, h);
   }
