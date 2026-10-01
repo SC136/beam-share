@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { LOGO } from './ui/art.js';
 
 export function version() {
   try {
@@ -9,7 +10,9 @@ export function version() {
   }
 }
 
-export const HELP = `beam - send files to devices on your local network, from the terminal.
+export const HELP = `${LOGO.join('\n')}
+
+beam - send files to devices on your local network, from the terminal.
 
 Usage:
   npx beam-share [options] [files or folders to send...]

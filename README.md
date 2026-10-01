@@ -1,3 +1,11 @@
+```
+ _
+| |__   ___  __ _ _ __ ___
+| '_ \ / _ \/ _` | '_ ` _ \
+| |_) |  __/ (_| | | | | | |
+|_.__/ \___|\__,_|_| |_| |_|
+```
+
 # beam
 
 Send files and folders between devices on the same network, straight from the terminal. No server, no account, no cloud.

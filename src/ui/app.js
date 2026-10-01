@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import os from 'node:os';
 import { isActive } from '../beam.js';
 import { formatBytes, formatDuration, formatRate, shortFp } from '../util.js';
+import { LOGO_HEIGHT, LOGO_WIDTH, TAGLINE, linkLine, logoLines } from './art.js';
 import { TextInput } from './input.js';
 import { FilePicker } from './picker.js';
 import { C, G, SPINNER, box, center, fit, padAnsi, padStart, paint, progressBar, stripAnsi, strWidth } from './term.js';
@@ -333,7 +334,8 @@ export class App {
 
   _mainBody(w, h) {
     const peers = this._peers();
-    const peersH = Math.max(5, Math.min(9, peers.length + 2));
+    // Taller while empty, to make room for the searching animation.
+    const peersH = peers.length === 0 ? 7 : Math.max(5, Math.min(9, peers.length + 2));
     return [
       ...this._peersBox(w, peersH, peers),
       ...this._transfersBox(w, h - peersH, this._transfers()),
@@ -347,12 +349,13 @@ export class App {
     const lines = [];
     if (peers.length === 0) {
       const spin = SPINNER[Math.floor(this.now() / 150) % SPINNER.length];
+      lines.push(linkLine(Math.floor(this.now() / 120), iw));
       lines.push(paint(`${spin} Looking for devices on your network...`, { fg: C.accent }));
-      lines.push(paint('Run `npx beam-share` on another device on the same Wi-Fi / LAN.', { fg: C.muted }));
+      lines.push(paint('Run `npx beam-share` on another device (same Wi-Fi).', { fg: C.muted }));
       const waited = this.now() - this.startedAt;
       if (this.beam.discoveryError) lines.push(paint(`Discovery problem: ${this.beam.discoveryError}`, { fg: C.warn }));
-      else if (waited > 10_000) lines.push(paint('Nothing yet? Allow Node through the firewall (private networks), or press a to add an IP.', { fg: C.warn }));
-      else lines.push(paint('Different subnet or blocked broadcast? Press a to connect by IP address.', { fg: C.muted }));
+      else if (waited > 10_000) lines.push(paint('No luck? Allow Node in the firewall, or press a.', { fg: C.warn }));
+      else lines.push(paint("Can't see it? Press a to connect by IP address.", { fg: C.muted }));
     } else {
       const showAddr = iw >= 44;
       const showFp = iw >= 64;
@@ -383,8 +386,14 @@ export class App {
     const focused = this.focus === 'transfers';
     const lines = [];
     if (transfers.length === 0) {
+      // The wordmark only appears when there's room for it plus the three hint lines.
+      if (h - 2 >= LOGO_HEIGHT + 5 && iw >= LOGO_WIDTH + 2) {
+        lines.push(...logoLines(iw));
+        const pad = Math.max(0, Math.floor((iw - TAGLINE.length) / 2));
+        lines.push(' '.repeat(pad) + paint(TAGLINE, { fg: C.muted }), '');
+      }
       lines.push(paint('No transfers yet.', { fg: C.muted }));
-      lines.push(paint('Pick a peer above and press s (or Enter) to choose files to send.', { fg: C.muted }));
+      lines.push(paint('Pick a peer above, then press s to choose files.', { fg: C.muted }));
       lines.push(paint(`Incoming files are saved to ${tildify(this.beam.downloadDir)}`, { fg: C.muted }));
     } else {
       const idx = Math.max(0, transfers.findIndex((t) => t.id === this.transferSel));
