@@ -13,18 +13,19 @@ after(cleanupAll);
 async function pairUp(opts = {}) {
   const sender = await makeBeam('sender');
   const receiver = await makeBeam('receiver', opts);
-  const peer = await link(sender, receiver);
+  const peer = link(sender, receiver);
   return { sender, receiver, peer };
 }
 
-test('addPeer learns name and identity over a real TLS connection', async () => {
+test('a found peer is listed; sending to an unknown peer fails clearly', async () => {
   const { sender, receiver, peer } = await pairUp();
   assert.equal(peer.name, 'receiver');
   assert.equal(peer.id, receiver.fingerprint);
+  assert.deepEqual(sender.peers().map((p) => p.id), [receiver.fingerprint]);
+  assert.equal(sender.foundPeer({ id: sender.fingerprint, name: 'me', address: '127.0.0.1', port: 1 }), null, 'ignores its own announcement');
   assert.equal(sender.peers().length, 1);
   assert.throws(() => sender.send('nonexistent', ['x']), /no longer available/);
-  await assert.rejects(sender.addPeer(`127.0.0.1:${sender.port}`), /this device/);
-  await assert.rejects(sender.addPeer('127.0.0.1:1'), /refused|unreachable|timed out/);
+  assert.throws(() => sender.send(peer.id, []), /nothing selected/);
 });
 
 test('sends a single file byte-for-byte, then both sides report done', async () => {
@@ -89,24 +90,10 @@ test('never overwrites: an existing file makes the incoming one "name (1).ext"',
   assert.equal(fs.readFileSync(path.join(receiver.downloadDir, 'notes (2).txt'), 'utf8'), 'NEW');
 });
 
-test('preserves modification time', async () => {
-  const { sender, receiver, peer } = await pairUp();
-  autoRespond(receiver);
-  const src = path.join(tmpdir(), 'old.txt');
-  fs.writeFileSync(src, 'x');
-  const when = new Date('2020-02-02T10:00:00Z');
-  fs.utimesSync(src, when, when);
-  const t = sender.send(peer.id, [src]);
-  await waitFor(() => settled(t));
-  assert.equal(t.status, 'done', t.error);
-  const m = fs.statSync(path.join(receiver.downloadDir, 'old.txt')).mtime;
-  assert.ok(Math.abs(m - when) < 2000, `mtime ${m.toISOString()}`);
-});
-
 test('receiver can decline; sender is told, nothing is written', async () => {
   const { sender, receiver, peer } = await pairUp();
   receiver.on('offer', (o) => {
-    assert.equal(o.peerName, 'sender');
+    assert.equal(o.senderName, 'sender');
     assert.equal(o.count, 1);
     assert.equal(o.total, 5);
     assert.equal(o.known, false, 'sender never announced itself to the receiver');
@@ -121,17 +108,6 @@ test('receiver can decline; sender is told, nothing is written', async () => {
   assert.equal(t.error, 'not now');
   assert.deepEqual(listTree(receiver.downloadDir), []);
   assert.equal(receiver.transfers().length, 0);
-});
-
-test('autoAccept skips the prompt entirely', async () => {
-  const { sender, receiver, peer } = await pairUp({ autoAccept: true });
-  receiver.on('offer', () => assert.fail('should not prompt'));
-  const src = path.join(tmpdir(), 'auto.txt');
-  fs.writeFileSync(src, 'auto');
-  const t = sender.send(peer.id, [src]);
-  await waitFor(() => settled(t));
-  assert.equal(t.status, 'done', t.error);
-  assert.equal(fs.readFileSync(path.join(receiver.downloadDir, 'auto.txt'), 'utf8'), 'auto');
 });
 
 test('sender cancelling while the offer is pending withdraws the prompt', async () => {
@@ -183,11 +159,11 @@ test('sender cancelling mid-transfer stops the receiver and removes partial file
 });
 
 test('refuses to send to a device whose certificate does not match the announced identity', async () => {
-  const { sender, receiver, peer } = await pairUp();
+  const { sender, receiver } = await pairUp();
   autoRespond(receiver);
   // Forge the peer table: same address/port, but pretend it announced a different identity.
   const fake = crypto.randomBytes(32).toString('hex');
-  sender._peers.set(fake, { ...peer, id: fake });
+  sender.foundPeer({ id: fake, name: 'impostor', address: '127.0.0.1', port: receiver.port });
   const src = path.join(tmpdir(), 'secret.txt');
   fs.writeFileSync(src, 'secret');
   const t = sender.send(fake, [src]);
@@ -237,6 +213,13 @@ test('throughput on loopback (informational) and large-file integrity', async ()
 
 // ---------------------------------------------------------------- hostile peers
 
+/** A device that says yes to every offer, so the checks under test are the only thing standing in the way. */
+async function acceptingBeam(name) {
+  const beam = await makeBeam(name);
+  autoRespond(beam);
+  return beam;
+}
+
 async function offerRaw(receiver, files, opts = {}) {
   const c = await rawClient(receiver);
   await writeFrame(c.sock, { t: 'offer', v: 1, name: 'mallory', files });
@@ -247,7 +230,7 @@ async function offerRaw(receiver, files, opts = {}) {
 }
 
 test('a malicious offer cannot write outside the download folder', async () => {
-  const receiver = await makeBeam('victim', { autoAccept: true });
+  const receiver = await acceptingBeam('victim');
   const outside = path.join(path.dirname(receiver.downloadDir), 'pwned.txt');
   for (const p of ['../pwned.txt', '../../pwned.txt', 'a/../../pwned.txt', '/abs/pwned.txt', '..', 'x//y', '']) {
     const { reply } = await offerRaw(receiver, [{ p, s: 1 }]);
@@ -259,7 +242,7 @@ test('a malicious offer cannot write outside the download folder', async () => {
 });
 
 test('a malicious offer with Windows-special or control-character names is neutralised, not rejected', async () => {
-  const receiver = await makeBeam('victim', { autoAccept: true });
+  const receiver = await acceptingBeam('victim');
   const c = await rawClient(receiver);
   const name = 'we\u001b[2Jird.txt';
   await writeFrame(c.sock, { t: 'offer', v: 1, name: 'm', files: [{ p: name, s: 2 }] });
@@ -274,7 +257,7 @@ test('a malicious offer with Windows-special or control-character names is neutr
 });
 
 test('malformed sizes, counts and message types are rejected without crashing the receiver', async () => {
-  const receiver = await makeBeam('victim', { autoAccept: true });
+  const receiver = await acceptingBeam('victim');
   const bad = [
     [{ p: 'a', s: -1 }],
     [{ p: 'a', s: 1.5 }],
@@ -309,7 +292,7 @@ test('malformed sizes, counts and message types are rejected without crashing th
 });
 
 test('a corrupted file is detected via checksum and discarded', async () => {
-  const receiver = await makeBeam('victim', { autoAccept: true });
+  const receiver = await acceptingBeam('victim');
   const c = await rawClient(receiver);
   await writeFrame(c.sock, { t: 'offer', v: 1, name: 'm', files: [{ p: 'good.txt', s: 5 }, { p: 'tampered.txt', s: 5 }] });
   assert.equal((await c.reader.readFrame()).ok, true);

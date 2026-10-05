@@ -1,28 +1,28 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import crypto from 'node:crypto';
-import { App, plain } from '../src/ui/app.js';
-import { TextInput } from '../src/ui/input.js';
-import { expandPath, FilePicker } from '../src/ui/picker.js';
-import { box, charWidth, fit, fitEnd, padAnsi, paint, progressBar, stripAnsi, strWidth } from '../src/ui/term.js';
+import { localAddresses } from '../src/beam.js';
 import { writeFrame } from '../src/protocol.js';
-import { cleanupAll, link, makeBeam, rawClient, settled, tmpdir, waitFor } from './helpers.js';
+import { App, plain } from '../src/ui/app.js';
+import { FilePicker } from '../src/ui/picker.js';
+import { box, charWidth, fit, fitEnd, padAnsi, paint, progressBar, stripAnsi, strWidth } from '../src/ui/term.js';
+import { autoRespond, cleanupAll, link, makeBeam, rawClient, settled, tmpdir, waitFor } from './helpers.js';
 
 after(cleanupAll);
 
 const W = 100;
 const H = 30;
 
-/** Type a key the way readline reports it. */
+/** Press a key the way readline would report it. */
 function press(app, k) {
-  const named = { enter: 'return', esc: 'escape', space: 'space', up: 'up', down: 'down', left: 'left', right: 'right', tab: 'tab', backspace: 'backspace', pageup: 'pageup', pagedown: 'pagedown', home: 'home', end: 'end' };
+  const named = { enter: 'return', esc: 'escape', space: 'space', up: 'up', down: 'down', left: 'left', right: 'right', tab: 'tab', backspace: 'backspace' };
   if (k in named) app.handleKey(k === 'space' ? ' ' : '', { name: named[k] });
   else app.handleKey(k, { name: k.toLowerCase(), shift: k !== k.toLowerCase() });
 }
-const type = (app, text) => [...text].forEach((c) => press(app, c === ' ' ? 'space' : c));
+const type = (app, text) => [...text].forEach((c) => press(app, c));
 const screen = (app, w = W, h = H) => plain(app.render(w, h)).join('\n');
 
 function makeApp(beam, extra = {}) {
@@ -32,13 +32,14 @@ function makeApp(beam, extra = {}) {
   return app;
 }
 
+/** Every line of a frame must be exactly `w` columns wide, and there must be exactly `h` lines. */
 function assertFrame(app, w, h, label) {
   const lines = app.render(w, h);
   assert.equal(lines.length, h, `${label}: height`);
-  lines.forEach((l, i) => assert.equal(strWidth(stripAnsi(l)), w, `${label}: line ${i} is ${strWidth(stripAnsi(l))} wide, want ${w}: ${JSON.stringify(stripAnsi(l))}`));
+  lines.forEach((l, i) => assert.equal(strWidth(stripAnsi(l)), w, `${label}: line ${i} is ${strWidth(stripAnsi(l))} wide, want ${w}`));
 }
 
-// ------------------------------------------------------------ term helpers
+// ------------------------------------------------------------ terminal helpers
 
 test('display width: wide, combining and control characters', () => {
   assert.equal(strWidth('abc'), 3);
@@ -64,7 +65,7 @@ test('fit / fitEnd / padAnsi produce exact widths and never split wide character
   assert.equal(stripAnsi(padAnsi('abc', 6)), 'abc   ');
 });
 
-test('box has exact dimensions, and progress bar fills proportionally', () => {
+test('box has exact dimensions, and the progress bar fills proportionally', () => {
   const b = box({ title: 'Title', w: 30, h: 5, lines: ['one', 'two'] });
   assert.equal(b.length, 5);
   for (const l of b) assert.equal(strWidth(stripAnsi(l)), 30);
@@ -74,63 +75,30 @@ test('box has exact dimensions, and progress bar fills proportionally', () => {
   assert.equal(stripAnsi(progressBar(-1, 4)), '░░░░');
 });
 
-test('text input editing', () => {
-  const t = new TextInput();
-  for (const c of 'hello') t.handle(c, { name: c });
-  assert.equal(t.value, 'hello');
-  t.handle('', { name: 'left' });
-  t.handle('', { name: 'backspace' });
-  assert.equal(t.value, 'helo');
-  t.handle('X', { name: 'x', shift: true });
-  assert.equal(t.value, 'helXo');
-  t.handle('', { name: 'home' });
-  t.handle('', { name: 'delete' });
-  assert.equal(t.value, 'elXo');
-  t.handle('', { name: 'w', ctrl: true });
-  assert.equal(t.value, 'elXo');
-  t.handle('', { name: 'end' });
-  t.handle('', { name: 'w', ctrl: true });
-  assert.equal(t.value, '');
-  t.insert('pasted\r\ntext\u001b[31m');
-  assert.ok(!/[\u0000-\u001f]/.test(t.value), 'control characters never enter the field');
-  assert.equal(t.handle('', { name: 'return' }), 'submit');
-  assert.equal(t.handle('', { name: 'escape' }), 'cancel');
-  assert.equal(strWidth(stripAnsi(t.render(20))), 20);
-  const long = new TextInput('x'.repeat(200));
-  assert.equal(strWidth(stripAnsi(long.render(20))), 20);
-});
-
 // ------------------------------------------------------------------ screens
 
-test('main screen: header, empty-state hint, and exact frame size at many terminal sizes', async () => {
+test('main screen: header, empty-state hint, and an exact frame at many terminal sizes', async () => {
   const beam = await makeBeam('my-laptop');
   const app = makeApp(beam);
   const s = screen(app);
-  assert.match(s, /beam\s+=\S{3}=\s+my-laptop/, 'badge, cat face, then the device name');
+  assert.match(s, /beam\s+my-laptop/);
   assert.match(s, /Looking for devices on your network/);
   assert.match(s, /npx beam-share/);
   assert.match(s, /No transfers yet/);
-  for (const [w, h] of [[56, 15], [60, 20], [80, 24], [100, 30], [140, 50], [200, 12 + 20]]) {
-    assertFrame(app, w, h, `${w}x${h} main`);
-  }
-  const tiny = plain(app.render(40, 10)).join('\n');
-  assert.match(tiny, /Terminal too small/);
+  for (const [w, h] of [[56, 15], [60, 20], [80, 24], [100, 30], [140, 50], [200, 32]]) assertFrame(app, w, h, `${w}x${h} main`);
+  assert.match(screen(app, 40, 10), /Terminal too small/);
 });
 
 test('every screen renders at exact size, including with long and wide-character names', async () => {
   const sender = await makeBeam('名前'.repeat(20)); // very long, double-width
   const receiver = await makeBeam('r'.repeat(80));
-  const peer = await link(sender, receiver);
+  const peer = link(sender, receiver);
   const app = makeApp(sender);
   for (const [w, h] of [[56, 15], [80, 24], [120, 40]]) {
     assertFrame(app, w, h, 'main');
     press(app, '?');
     assertFrame(app, w, h, 'help');
-    press(app, 'x'); // any key closes
-    press(app, 'a');
-    type(app, 'x'.repeat(300));
-    assertFrame(app, w, h, 'addpeer');
-    press(app, 'esc');
+    press(app, 'x'); // any key closes help
     assert.equal(app.selectedPeer().id, peer.id);
     press(app, 's');
     assert.equal(app.mode, 'picker');
@@ -140,14 +108,14 @@ test('every screen renders at exact size, including with long and wide-character
   }
 });
 
-test('peers panel lists discovered devices with address and id; empty-state disappears', async () => {
+test('the peers panel lists found devices with address and id; the empty hint disappears', async () => {
   const a = await makeBeam('alice');
   const b = await makeBeam('bob');
   const app = makeApp(a);
-  await link(a, b);
+  link(a, b);
   const s = screen(app);
   assert.match(s, /Peers \(1\)/);
-  assert.match(s, /bob\s+127\.0\.0\.1:\d+\s+[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}\s+● online/);
+  assert.match(s, /bob\s+127\.0\.0\.1:\d+\s+[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}/);
   assert.doesNotMatch(s, /Looking for devices/);
 });
 
@@ -156,6 +124,34 @@ test('pressing s with no peers explains what to do instead of opening the picker
   press(app, 's');
   assert.equal(app.mode, 'main');
   assert.match(screen(app), /No peer to send to yet/);
+});
+
+test('the empty transfers panel shows the logo and cat when there is room, not when there is not', async () => {
+  const app = makeApp(await makeBeam('x'));
+  const roomy = screen(app, 100, 30);
+  assert.match(roomy, /\( o\.o \)\s+\| \|_\) \|/, 'cat stands beside the logo');
+  assert.match(roomy, /send files to devices on your network/);
+  const cramped = screen(app, 56, 15);
+  assert.doesNotMatch(cramped, /\( o\.o \)/);
+  assert.match(cramped, /Pick a peer above, then press s to choose files\./, 'hint text fits unclipped');
+});
+
+test('local addresses list real adapters before virtual ones', async () => {
+  const { mock } = await import('node:test');
+  const fake = (address) => [{ address, family: 'IPv4', internal: false, netmask: '255.255.255.0' }];
+  const m = mock.method(os, 'networkInterfaces', () => ({
+    'VMware Network Adapter VMnet1': fake('192.168.160.1'),
+    'vEthernet (WSL)': fake('172.20.0.1'),
+    'Wi-Fi': fake('10.90.70.231'),
+    docker0: fake('172.17.0.1'),
+    eth0: fake('192.168.1.5'),
+    lo: [{ address: '127.0.0.1', family: 'IPv4', internal: true, netmask: '255.0.0.0' }],
+  }));
+  try {
+    assert.deepEqual(localAddresses(), ['10.90.70.231', '192.168.1.5', '192.168.160.1', '172.20.0.1', '172.17.0.1']);
+  } finally {
+    m.mock.restore();
+  }
 });
 
 // ------------------------------------------------------------------- picker
@@ -172,10 +168,10 @@ function sampleTree() {
   return root;
 }
 
-function pickerFor(root, preselect = []) {
+function pickerFor(root) {
   const sent = [];
   let cancelled = false;
-  const p = new FilePicker({ startDir: root, preselect, onSend: (x) => sent.push(x), onCancel: () => (cancelled = true) });
+  const p = new FilePicker({ startDir: root, onSend: (x) => sent.push(x), onCancel: () => (cancelled = true) });
   return { p, sent, get cancelled() { return cancelled; } };
 }
 const names = (p) => p.entries.map((e) => e.name);
@@ -184,20 +180,20 @@ const k = (p, key) => p.handleKey(key === 'space' ? ' ' : key.length === 1 ? key
 test('picker lists folders first, hides dotfiles, and toggles hidden with "."', () => {
   const { p } = pickerFor(sampleTree());
   assert.deepEqual(names(p), ['..', 'docs', 'alpha.txt', 'beta file.txt']);
-  assert.equal(p.current.name, 'docs', 'cursor starts on the first real item');
+  assert.equal(p.current.name, 'docs', 'the cursor starts on the first real item');
   k(p, '.');
   assert.deepEqual(names(p), ['..', '.hidden-dir', 'docs', '.secret', 'alpha.txt', 'beta file.txt']);
   k(p, '.');
   assert.deepEqual(names(p), ['..', 'docs', 'alpha.txt', 'beta file.txt']);
 });
 
-test('picker navigation: open folder, go up and land on the folder we left', () => {
+test('picker navigation: open a folder, go up, and land on the folder we left', () => {
   const root = sampleTree();
   const { p } = pickerFor(root);
   k(p, 'return'); // open docs
   assert.equal(p.dir, path.join(root, 'docs'));
   assert.deepEqual(names(p), ['..', 'sub', 'readme.md']);
-  k(p, 'right'); // open sub (cursor starts on first item)
+  k(p, 'right'); // open sub
   assert.equal(p.dir, path.join(root, 'docs', 'sub'));
   k(p, 'left');
   assert.equal(p.dir, path.join(root, 'docs'));
@@ -207,15 +203,15 @@ test('picker navigation: open folder, go up and land on the folder we left', () 
   assert.equal(p.current.name, 'docs');
 });
 
-test('picker selection: space toggles and advances, enter on a file toggles, send gives absolute paths in order', () => {
+test('picker selection: space toggles and advances, enter on a file toggles, send gives absolute paths', () => {
   const root = sampleTree();
   const { p, sent } = pickerFor(root);
   k(p, 'space'); // docs
   k(p, 'space'); // alpha.txt
   assert.equal(p.cursor, 3);
-  k(p, 'return'); // beta toggled on via enter (file)
+  k(p, 'return'); // beta file.txt, selected with enter
   k(p, 'up');
-  k(p, 'space'); // alpha off again; cursor moves on to beta
+  k(p, 'space'); // alpha.txt off again
   assert.match(p.summary(), /1 file.*1 folder/);
   k(p, 's');
   assert.deepEqual(sent, [[path.join(root, 'docs'), path.join(root, 'beta file.txt')]]);
@@ -234,47 +230,21 @@ test('picker: with nothing selected, s sends the highlighted item; on ".." it re
   assert.deepEqual(sent, [[path.join(root, 'alpha.txt')]]);
 });
 
-test('picker: "a" selects everything in the folder and again clears it', () => {
-  const { p } = pickerFor(sampleTree());
-  k(p, 'a');
-  assert.equal(p.selected.size, 3);
-  k(p, 'a');
-  assert.equal(p.selected.size, 0);
-});
-
-test('picker path prompt: dropped quoted paths, folders and missing paths', () => {
+test('picker: the selection survives moving between folders', () => {
   const root = sampleTree();
-  const { p } = pickerFor(root);
-  const submit = (text) => {
-    k(p, '/');
-    assert.ok(p.prompt);
-    for (const c of text) p.handleKey(c, { name: c.toLowerCase() });
-    p.handleKey('', { name: 'return' });
-  };
-  submit(`"${path.join(root, 'beta file.txt')}"`); // what a terminal pastes when you drop a file with spaces
-  assert.ok(p.selected.has(path.join(root, 'beta file.txt')));
-  assert.equal(p.current.name, 'beta file.txt');
-  submit(path.join(root, 'docs'));
-  assert.equal(p.dir, path.join(root, 'docs'));
-  submit('sub');
-  assert.equal(p.dir, path.join(root, 'docs', 'sub'));
-  submit(path.join(root, 'nope'));
-  assert.match(p.message, /Not found/);
-  k(p, '/');
-  p.handleKey('', { name: 'escape' });
-  assert.equal(p.prompt, null);
-  assert.equal(expandPath('~', root), os.homedir());
-  assert.equal(expandPath('~/x', root), path.join(os.homedir(), 'x'));
+  const { p, sent } = pickerFor(root);
+  k(p, 'down'); // alpha.txt (the cursor started on docs)
+  k(p, 'space'); // selects it, and the cursor moves on to "beta file.txt"
+  k(p, 'up');
+  k(p, 'up'); // back on docs
+  k(p, 'return'); // open docs: the cursor starts on "sub"
+  k(p, 'down'); // readme.md
+  k(p, 'space');
+  k(p, 's');
+  assert.deepEqual(sent, [[path.join(root, 'alpha.txt'), path.join(root, 'docs', 'readme.md')]]);
 });
 
-test('picker preselect (files named on the command line) starts selected and focused', () => {
-  const root = sampleTree();
-  const { p } = pickerFor(root, [path.join(root, 'beta file.txt'), path.join(root, 'ghost.txt')]);
-  assert.equal(p.selected.size, 1, 'vanished files are dropped');
-  assert.equal(p.current.name, 'beta file.txt');
-});
-
-test('picker escape and q cancel; unreadable start dir falls back instead of crashing', () => {
+test('picker: escape and q cancel; an unreadable start folder falls back instead of crashing', () => {
   const root = sampleTree();
   const a = pickerFor(root);
   k(a.p, 'escape');
@@ -288,32 +258,31 @@ test('picker escape and q cancel; unreadable start dir falls back instead of cra
 
 // -------------------------------------------------- full two-sided UI flows
 
-async function twoApps(optsB = {}) {
+async function twoApps({ bobAccepts = false } = {}) {
   const alice = await makeBeam('alice');
-  const bob = await makeBeam('bob', optsB);
-  await link(alice, bob);
-  await link(bob, alice);
+  const bob = await makeBeam('bob');
+  link(alice, bob);
+  link(bob, alice);
+  if (bobAccepts) autoRespond(bob);
   const dir = sampleTree();
-  const a = makeApp(alice, { startDir: dir });
-  const b = makeApp(bob);
-  return { alice, bob, a, b, dir };
+  return { alice, bob, a: makeApp(alice, { startDir: dir }), b: makeApp(bob), dir };
 }
 
-test('end to end through both UIs: pick a peer, choose a file, receiver accepts, file arrives', async () => {
-  const { alice, bob, a, b, dir } = await twoApps();
+test('end to end through both UIs: pick a peer, choose a file, the receiver accepts, the file arrives', async () => {
+  const { alice, bob, a, b } = await twoApps();
 
-  press(a, 's'); // open picker for bob
+  press(a, 's'); // open the picker for bob
   assert.equal(a.mode, 'picker');
   assert.match(screen(a), /Send to bob/);
   assert.match(screen(a), /alpha\.txt/);
-  press(a, 'down'); // cursor starts on "docs"; move to alpha.txt
+  press(a, 'down'); // the cursor starts on "docs"; move to alpha.txt
   press(a, 'space');
   press(a, 's');
   assert.equal(a.mode, 'main');
   assert.equal(a.focus, 'transfers');
   assert.match(screen(a), /Sending alpha\.txt to bob/);
 
-  await waitFor(() => b.offers.length === 1, 5000, 'offer to reach bob');
+  await waitFor(() => b.offers.length === 1, 5000, 'the offer to reach bob');
   const modal = screen(b);
   assert.match(modal, /Incoming transfer/);
   assert.match(modal, /alice wants to send you/);
@@ -324,13 +293,12 @@ test('end to end through both UIs: pick a peer, choose a file, receiver accepts,
 
   press(b, 'y');
   assert.equal(b.offers.length, 0);
-  await waitFor(() => alice.transfers().every(settled) && bob.transfers().length && bob.transfers().every(settled), 8000, 'transfer to finish');
+  await waitFor(() => alice.transfers().every(settled) && bob.transfers().length && bob.transfers().every(settled), 8000, 'the transfer to finish');
   assert.equal(fs.readFileSync(path.join(bob.downloadDir, 'alpha.txt'), 'utf8'), 'aaaa');
   assert.match(screen(a), /↑\s+bob\s+alpha\.txt/);
   assert.match(screen(a), /✓ 4 B in/);
   assert.match(screen(b), /↓\s+alice\s+alpha\.txt/);
   assert.match(screen(b), /✓ 4 B in .*↓/);
-  assert.deepEqual(a.opened, []);
   press(b, 'o');
   assert.deepEqual(b.opened, [bob.downloadDir]);
 });
@@ -348,19 +316,19 @@ test('declining from the UI tells the sender and writes nothing', async () => {
   assert.equal(fs.readdirSync(bob.downloadDir).length, 0);
 });
 
-test('offers while typing elsewhere are not answered by stray keystrokes; a banner points to them', async () => {
+test('keystrokes meant for another screen never answer an offer; a banner points to it instead', async () => {
   const { a, b, bob } = await twoApps();
   press(a, 's');
   press(a, 'down');
   press(a, 'space');
   press(a, 's');
-  press(b, 'a'); // bob is typing an address when the offer lands
+  press(b, 's'); // bob is browsing for files when the offer lands
+  assert.equal(b.mode, 'picker');
   await waitFor(() => b.offers.length === 1);
-  type(b, 'yes-nnn');
-  assert.equal(b.offers.length, 1, 'typing y/n into the address box must not accept or decline');
-  assert.equal(b.input.value, 'yes-nnn');
+  type(b, 'yyynnn');
+  assert.equal(b.offers.length, 1, 'y and n typed in the picker must not accept or decline');
   assert.match(screen(b), /1 incoming transfer waiting/);
-  press(b, 'esc');
+  press(b, 'esc'); // leave the picker
   assert.match(screen(b), /Incoming transfer/);
   press(b, 'n');
   await waitFor(() => bob.pendingOffers().length === 0);
@@ -368,8 +336,7 @@ test('offers while typing elsewhere are not answered by stray keystrokes; a bann
 
 test('queued offers are answered one at a time', async () => {
   const { alice, b, a } = await twoApps();
-  const files = ['alpha.txt', 'beta file.txt'].map((n) => path.join(a.lastDir, n));
-  for (const f of files) alice.send(alice.peers()[0].id, [f]);
+  for (const name of ['alpha.txt', 'beta file.txt']) alice.send(alice.peers()[0].id, [path.join(a.lastDir, name)]);
   await waitFor(() => b.offers.length === 2);
   assert.match(screen(b), /\(1 more waiting\)/);
   press(b, 'y');
@@ -388,93 +355,41 @@ test('hostile file and device names cannot inject terminal escape sequences into
   });
   await waitFor(() => app.offers.length === 1);
   const raw = app.render(100, 30).join('\n');
-  // Our own styling uses ESC[...m; nothing else may appear, and no OSC / cursor movement / clear.
-  const withoutSgr = raw.replace(/\x1b\[[0-9;]*m/g, '');
-  assert.ok(!/[\u0000-\u0008\u000b-\u001f\u007f\u202e]/.test(withoutSgr), `unexpected control chars: ${JSON.stringify(withoutSgr.match(/[\u0000-\u0008\u000b-\u001f\u007f\u202e]/))}`);
+  // Our own styling uses ESC[...m; nothing else may appear: no OSC, cursor movement, clear, bell or bidi override.
+  const withoutStyling = raw.replace(/\x1b\[[0-9;]*m/g, '');
+  assert.ok(!/[\u0000-\u0008\u000b-\u001f\u007f\u202e]/.test(withoutStyling), `unexpected control characters: ${JSON.stringify(withoutStyling.match(/[\u0000-\u0008\u000b-\u001f\u007f\u202e]/))}`);
   c.sock.destroy();
 });
 
-test('quit asks for confirmation while transfers are running', async () => {
-  const { alice, bob, a, b } = await twoApps({ autoAccept: true });
-  let quit = 0;
-  a.onQuit = () => quit++;
+test('quit asks for confirmation while a transfer is running, and x cancels from the UI', async () => {
+  const { alice, a } = await twoApps({ bobAccepts: true });
+  let quits = 0;
+  a.onQuit = () => quits++;
   press(a, 'q');
-  assert.equal(quit, 1, 'nothing running: quits immediately');
+  assert.equal(quits, 1, 'nothing running: quits immediately');
 
   const big = path.join(tmpdir(), 'big.bin');
   const fd = fs.openSync(big, 'w');
   for (let i = 0; i < 48; i++) fs.writeSync(fd, crypto.randomBytes(1 << 20));
   fs.closeSync(fd);
   const t = alice.send(alice.peers()[0].id, [big]);
-  await waitFor(() => t.status === 'active' && t.done > 0, 5000, 'transfer to start');
+  await waitFor(() => t.status === 'active' && t.done > 0, 5000, 'the transfer to start');
   press(a, 'q');
-  assert.equal(quit, 1, 'first q with a running transfer only warns');
+  assert.equal(quits, 1, 'the first q with a running transfer only warns');
   assert.match(screen(a), /1 transfer running - press q again/);
   press(a, 'q');
-  assert.equal(quit, 2);
+  assert.equal(quits, 2);
 
-  // cancel from the UI: focus transfers, x
   a.focus = 'transfers';
   press(a, 'x');
-  await waitFor(() => settled(t), 5000, 'cancel to take effect');
+  await waitFor(() => settled(t), 5000, 'the cancel to take effect');
   assert.equal(t.status, 'cancelled');
   press(a, 'c');
   assert.equal(alice.transfers().length, 0, 'c clears finished transfers');
 });
 
-test('add peer by address from the UI, including errors', async () => {
-  const alice = await makeBeam('alice');
-  const bob = await makeBeam('bob');
-  const a = makeApp(alice);
-  press(a, 'a');
-  assert.equal(a.mode, 'addpeer');
-  assert.match(screen(a), /Connect to a device by address/);
-  type(a, `127.0.0.1:${bob.port}`);
-  press(a, 'enter');
-  assert.equal(a.mode, 'main');
-  await waitFor(() => alice.peers().length === 1, 5000, 'peer added');
-  assert.match(screen(a), /bob/);
-  await waitFor(() => /Added bob/.test(screen(a)));
-
-  press(a, 'a');
-  type(a, '127.0.0.1:1');
-  press(a, 'enter');
-  await waitFor(() => /Couldn't add 127\.0\.0\.1:1/.test(screen(a)), 8000, 'error message');
-});
-
-test('auto-accept toggle is visible in the header, even when the header is crowded', async () => {
-  const app = makeApp(await makeBeam('x'.repeat(40), { downloadDir: path.join(tmpdir(), 'a-very-long-folder-name'.repeat(4)) }));
-  assert.doesNotMatch(screen(app), /AUTO-ACCEPT/);
-  press(app, 'A');
-  assert.match(screen(app, 56, 20), /AUTO-ACCEPT/, 'badge must survive on the narrowest supported terminal');
-  assert.match(screen(app), /AUTO-ACCEPT/);
-  assert.match(screen(app), /Auto-accept ON/);
-  press(app, 'A');
-  assert.doesNotMatch(screen(app), /AUTO-ACCEPT/);
-});
-
-test('local addresses list real adapters before virtual ones', async () => {
-  const os = await import('node:os');
-  const { mock } = await import('node:test');
-  const { localAddresses } = await import('../src/beam.js');
-  const fake = (address) => [{ address, family: 'IPv4', internal: false, netmask: '255.255.255.0' }];
-  const m = mock.method(os.default, 'networkInterfaces', () => ({
-    'VMware Network Adapter VMnet1': fake('192.168.160.1'),
-    'vEthernet (WSL)': fake('172.20.0.1'),
-    'Wi-Fi': fake('10.90.70.231'),
-    docker0: fake('172.17.0.1'),
-    eth0: fake('192.168.1.5'),
-    lo: [{ address: '127.0.0.1', family: 'IPv4', internal: true, netmask: '255.0.0.0' }],
-  }));
-  try {
-    assert.deepEqual(localAddresses(), ['10.90.70.231', '192.168.1.5', '192.168.160.1', '172.20.0.1', '172.17.0.1']);
-  } finally {
-    m.mock.restore();
-  }
-});
-
 test('a new transfer takes the highlight only if the newest was highlighted (so x never hits the wrong one)', async () => {
-  const { alice, a } = await twoApps({ autoAccept: true });
+  const { alice, a } = await twoApps({ bobAccepts: true });
   const peerId = alice.peers()[0].id;
   const file = path.join(a.lastDir, 'alpha.txt');
   const send = async () => {
@@ -484,12 +399,12 @@ test('a new transfer takes the highlight only if the newest was highlighted (so 
     return t;
   };
   const t1 = await send();
-  assert.equal(a.selectedTransfer().id, t1.id, 'first transfer is highlighted');
+  assert.equal(a.selectedTransfer().id, t1.id, 'the first transfer is highlighted');
   const t2 = await send();
-  assert.equal(a.selectedTransfer().id, t2.id, 'highlight follows the newest while you are on it');
+  assert.equal(a.selectedTransfer().id, t2.id, 'the highlight follows the newest while you are on it');
   a.focus = 'transfers';
   press(a, 'down'); // move off the newest, onto t1
   assert.equal(a.selectedTransfer().id, t1.id);
-  const t3 = await send();
-  assert.equal(a.selectedTransfer().id, t1.id, `highlight stays put when t${t3.id} appears`);
+  await send();
+  assert.equal(a.selectedTransfer().id, t1.id, 'the highlight stays put when a newer transfer appears');
 });

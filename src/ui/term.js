@@ -9,7 +9,7 @@ export const stripAnsi = (s) => s.replace(ANSI_RE, '');
 
 // ------------------------------------------------------------------ glyphs
 
-const UNICODE = {
+export const G = {
   box: { tl: '╭', tr: '╮', bl: '╰', br: '╯', h: '─', v: '│' },
   bar: { full: '█', empty: '░' },
   up: '↑',
@@ -17,34 +17,13 @@ const UNICODE = {
   pointer: '▸',
   ok: '✓',
   bad: '✗',
-  on: '●',
-  off: '○',
   bullet: '•',
 };
-const ASCII = {
-  box: { tl: '+', tr: '+', bl: '+', br: '+', h: '-', v: '|' },
-  bar: { full: '#', empty: '-' },
-  up: '^',
-  down: 'v',
-  pointer: '>',
-  ok: 'v',
-  bad: 'x',
-  on: '*',
-  off: 'o',
-  bullet: '*',
-};
-export let G = process.env.BEAM_ASCII ? ASCII : UNICODE;
-export function setAscii(on) {
-  G = on ? ASCII : UNICODE;
-}
 export const SPINNER = '|/-\\';
 
 // ------------------------------------------------------------------ colour
 
-let colorOn = process.env.NO_COLOR === undefined;
-export function setColor(on) {
-  colorOn = on;
-}
+const colorOn = process.env.NO_COLOR === undefined;
 
 /** 256-colour palette indices. */
 export const C = { accent: 81, ok: 78, warn: 221, bad: 203, muted: 245, sel: 237, title: 255 };

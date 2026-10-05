@@ -5,7 +5,7 @@ import { autoRespond, cleanupAll, hashFile, link, makeBeam, settled, tmpdir, wai
 const mib = Number(process.argv[2] || 256);
 const sender = await makeBeam('sender');
 const receiver = await makeBeam('receiver');
-const peer = await link(sender, receiver);
+const peer = link(sender, receiver);
 autoRespond(receiver);
 const src = path.join(tmpdir(), 'bench.bin');
 const sum = writeRandomFile(src, mib * 1024 * 1024);

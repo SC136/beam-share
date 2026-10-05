@@ -1,72 +1,31 @@
-import fs from 'node:fs';
-import { Beam, localAddresses } from './beam.js';
-import { HELP, RELAY_HELP, parseArgs, version } from './cli.js';
-import { startRelay } from './relay.js';
-import { generateCode } from './room.js';
-import { farewell } from './ui/art.js';
+// Wires the pieces together: options -> engine (Beam) -> UI (App) -> terminal (Screen).
+import { Beam } from './beam.js';
+import { HELP, parseArgs, version } from './cli.js';
 import { App } from './ui/app.js';
-import { Screen, setAscii } from './ui/term.js';
+import { farewell } from './ui/art.js';
+import { Screen } from './ui/term.js';
 import { formatBytes, sleep } from './util.js';
 
-/** `beam relay`: run the relay server (no UI - just a log). */
-async function runRelay(opts) {
-  const stamp = () => new Date().toTimeString().slice(0, 8);
-  let relay;
-  try {
-    relay = await startRelay({
-      port: opts.port,
-      host: opts.host,
-      token: opts.token,
-      trustProxy: opts.trustProxy,
-      log: (line) => console.log(`${stamp()}  ${line}`),
-    });
-  } catch (e) {
-    console.error(`beam relay: could not start: ${e.message}`);
-    process.exit(1);
-  }
-  const addrs = opts.host === '0.0.0.0' ? localAddresses() : [opts.host];
-  console.log('\nTell everyone to use it with:');
-  for (const a of addrs.length ? addrs : ['<this machine\'s address>']) console.log(`  beam --relay ${a}:${relay.port}`);
-  console.log(opts.token ? '\nClients must also pass --relay-token (or set BEAM_RELAY_TOKEN).' : '\nNo token set: anyone who can reach this relay can use it. Use --token on a public one.');
-  console.log('Press Ctrl+C to stop.\n');
-  const stop = async () => {
-    await Promise.race([relay.close(), sleep(2000)]);
-    process.exit(0);
-  };
-  process.on('SIGINT', stop);
-  process.on('SIGTERM', stop);
-}
-
 export async function main(argv) {
-  const { command, opts, queued, peers, help, error, version: wantVersion } = parseArgs(argv);
+  const { opts, error } = parseArgs(argv);
   if (error) {
-    console.error(`beam: ${error}\nTry: beam ${command === 'relay' ? 'relay ' : ''}--help`);
+    console.error(`beam: ${error}\nTry: beam --help`);
     process.exit(2);
   }
-  if (command === 'relay') return help ? void process.stdout.write(RELAY_HELP) : runRelay(opts);
-  if (help) return void process.stdout.write(HELP);
-  if (wantVersion) return void console.log(version());
+  if (opts.help) return void process.stdout.write(HELP);
+  if (opts.version) return void console.log(version());
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     console.error('beam needs an interactive terminal (it draws a full-screen interface).');
     process.exit(1);
   }
-  const missing = queued.filter((p) => !fs.existsSync(p));
-  if (missing.length) {
-    console.error(`beam: no such file or folder: ${missing[0]}`);
-    process.exit(2);
-  }
-  if (opts.ascii) setAscii(true);
 
+  // The engine: finds peers, sends and receives.
   const beam = new Beam({
     name: opts.name,
     downloadDir: opts.dir,
     port: opts.port,
     discoveryPort: opts.discoveryPort,
-    configDir: opts.config,
-    autoAccept: opts.autoAccept,
-    discovery: !opts.noDiscovery,
-    relay: opts.relay,
-    relayToken: opts.relayToken,
+    configDir: opts.configDir,
   });
   try {
     await beam.start();
@@ -74,68 +33,47 @@ export async function main(argv) {
     console.error(`beam: could not start: ${e.message}`);
     process.exit(1);
   }
-  if (opts.room && !beam.relayUrl) {
-    await beam.stop();
-    console.error('beam: --room needs a relay server - add --relay <address> (see "beam relay --help").');
-    process.exit(2);
-  }
 
-  const app = new App(beam, { startDir: process.cwd(), queued });
+  // The UI: state and keys. The screen: the real terminal, which it draws on.
+  const app = new App(beam);
   const screen = new Screen();
-  let scheduled = false;
+  let drawQueued = false;
   const draw = () => {
-    if (scheduled) return;
-    scheduled = true;
+    if (drawQueued) return; // many changes in one tick produce one redraw
+    drawQueued = true;
     setImmediate(() => {
-      scheduled = false;
+      drawQueued = false;
       screen.draw(app.render(screen.w, screen.h));
     });
   };
   app.onChange = draw;
+  beam.on('warning', (message) => app.flash(message, 'warn', 8000));
+  const spinnerTimer = setInterval(draw, 250); // keeps spinners, ETAs and expiring messages moving
 
   let quitting = false;
-  const quit = async (code = 0) => {
+  async function quit() {
     if (quitting) return;
     quitting = true;
-    clearInterval(ticker);
+    clearInterval(spinnerTimer);
     screen.leave();
     app.detach();
     const received = beam.transfers().filter((t) => t.dir === 'recv' && t.status === 'done');
     await Promise.race([beam.stop().catch(() => {}), sleep(2000)]);
-    let summary = '';
-    if (received.length) {
-      const total = received.reduce((n, t) => n + t.total, 0);
-      summary = `received ${formatBytes(total)} in ${received.length} transfer${received.length > 1 ? 's' : ''}`;
-    }
-    console.log(['', ...farewell(summary)].join('\n'));
+    const total = received.reduce((sum, t) => sum + t.total, 0);
+    console.log(['', ...farewell(received.length ? `received ${formatBytes(total)} in ${received.length} transfer(s)` : '')].join('\n'));
     if (received.length) console.log(`  saved in ${beam.downloadDir}`);
-    process.exit(code);
-  };
-  app.onQuit = () => quit(0);
-  beam.on('warning', (m) => app.flash(m, 'warn', 8000));
-
-  // Redraw regularly for spinners, ETAs and expiring messages.
-  const ticker = setInterval(draw, 250);
+    process.exit(0);
+  }
+  app.onQuit = quit;
+  process.on('SIGINT', quit);
+  process.on('SIGTERM', quit);
   process.on('exit', () => screen.leave()); // never leave the terminal in raw mode / alt screen
   process.on('uncaughtException', (e) => {
     screen.leave();
     console.error(e);
     process.exit(1);
   });
-  process.on('SIGINT', () => quit(0));
-  process.on('SIGTERM', () => quit(0));
 
-  screen.enter({ onKey: (s, k) => app.handleKey(s, k), onResize: draw });
-  for (const p of peers) {
-    beam.addPeer(p).catch((e) => app.flash(`Couldn't add ${p}: ${e.message}`, 'bad', 6000));
-  }
-  if (opts.room) {
-    const created = opts.room === 'new';
-    const code = created ? generateCode() : opts.room;
-    beam.joinRoom(code).then(
-      () => app.flash(created ? `Room created - the code is ${code} (press r to see it again)` : 'Joined the room', 'ok', created ? 60_000 : 5000),
-      (e) => app.flash(`Couldn't join the room: ${e.message}`, 'bad', 10_000),
-    );
-  }
+  screen.enter({ onKey: (str, key) => app.handleKey(str, key), onResize: draw });
   draw();
 }

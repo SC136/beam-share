@@ -1,71 +1,47 @@
-// Keyboard-driven file browser used to choose what to send.
+// A keyboard-driven file browser for choosing what to send.
+// Arrows move, Space selects (files or whole folders), Enter/→ opens a folder, ← goes up, s sends.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { formatBytes } from '../util.js';
-import { TextInput } from './input.js';
-import { C, G, fit, fitEnd, paint, padStart } from './term.js';
+import { C, G, fit, fitEnd, padStart, paint } from './term.js';
 
-/** Resolve text typed or pasted/dropped into the path prompt. */
-export function expandPath(input, base) {
-  let s = String(input).trim();
-  if (s.length >= 2 && ((s[0] === '"' && s.at(-1) === '"') || (s[0] === "'" && s.at(-1) === "'"))) s = s.slice(1, -1);
-  if (process.platform !== 'win32') s = s.replace(/\\(.)/g, '$1'); // terminals escape spaces when you drop a file
-  if (s === '~' || s.startsWith('~/') || s.startsWith('~\\')) s = path.join(os.homedir(), s.slice(1));
-  return path.resolve(base, s);
-}
-
+/** On Windows the "parent of C:\" is the list of drives. */
 function listDrives() {
-  const out = [];
-  for (let c = 'C'.charCodeAt(0); c <= 'Z'.charCodeAt(0); c++) {
-    const root = `${String.fromCharCode(c)}:\\`;
-    if (fs.existsSync(root)) out.push({ name: root, abs: root, isDir: true });
+  const drives = [];
+  for (let letter = 'C'.charCodeAt(0); letter <= 'Z'.charCodeAt(0); letter++) {
+    const root = `${String.fromCharCode(letter)}:\\`;
+    if (fs.existsSync(root)) drives.push({ name: root, abs: root, isDir: true });
   }
-  return out;
+  return drives;
 }
 
 export class FilePicker {
   /**
    * @param {object} o
-   * @param {string} o.startDir
-   * @param {string[]} [o.preselect]   absolute paths to start selected
-   * @param {(paths:string[])=>void} o.onSend
-   * @param {()=>void} o.onCancel
+   * @param {string} o.startDir                    folder to open first
+   * @param {(paths: string[]) => void} o.onSend   called with the absolute paths to send
+   * @param {() => void} o.onCancel
    */
-  constructor({ startDir, preselect = [], onSend, onCancel }) {
+  constructor({ startDir, onSend, onCancel }) {
     this.onSend = onSend;
     this.onCancel = onCancel;
-    this.dir = null;
-    this.entries = [];
+    this.dir = null; //        the folder being shown (null = the list of drives)
+    this.entries = []; //      {name, abs, isDir, parent?}
     this.cursor = 0;
-    this.offset = 0;
-    this.selected = new Map(); // abs -> {isDir}
+    this.offset = 0; //        index of the first visible row
+    this.selected = new Map(); // abs path -> {isDir}; survives moving between folders
     this.showHidden = false;
-    this.prompt = null;
     this.message = '';
-    this._sizes = new Map();
-    for (const p of preselect) {
-      try {
-        this.selected.set(p, { isDir: fs.statSync(p).isDirectory() });
-      } catch {
-        /* vanished since it was queued */
-      }
-    }
-    const first = preselect[0];
+    this._sizes = new Map(); // file sizes, looked up lazily
     if (!this.load(startDir) && !this.load(os.homedir())) this.load(path.parse(process.cwd()).root);
-    if (first && path.dirname(first) === this.dir) this.focus(path.basename(first));
   }
 
   get current() {
     return this.entries[this.cursor];
   }
 
-  focus(name) {
-    const i = this.entries.findIndex((e) => e.name === name);
-    if (i >= 0) this.cursor = i;
-  }
-
-  /** Read `dir` (null = list of drives on Windows). Returns false if it can't be opened. */
+  /** Show `dir` (null = drives). Returns false if it can't be opened. */
   load(dir, focusName) {
     let entries;
     if (dir === null) {
@@ -87,17 +63,16 @@ export class FilePicker {
           try {
             isDir = fs.statSync(abs).isDirectory();
           } catch {
-            continue; // dangling link
+            continue; // a link to nowhere
           }
         } else if (!isDir && !d.isFile()) {
           continue; // sockets, devices...
         }
         entries.push({ name: d.name, abs, isDir });
       }
+      // folders first, then files, each in natural order (file2 before file10)
       entries.sort(
-        (a, b) =>
-          Number(b.isDir) - Number(a.isDir) ||
-          a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }),
+        (a, b) => Number(b.isDir) - Number(a.isDir) || a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }),
       );
       const parent = path.dirname(dir);
       if (parent !== dir) entries.unshift({ name: '..', abs: parent, isDir: true, parent: true });
@@ -105,28 +80,27 @@ export class FilePicker {
     }
     this.dir = dir;
     this.entries = entries;
-    this.cursor = 0;
+    this.cursor = entries[0]?.parent && entries.length > 1 ? 1 : 0; // start on the first real item, not ".."
     this.offset = 0;
     this.message = '';
-    if (focusName) this.focus(focusName);
-    else if (entries[0]?.parent && entries.length > 1) this.cursor = 1; // start on the first real item
+    if (focusName) {
+      const i = entries.findIndex((e) => e.name === focusName);
+      if (i >= 0) this.cursor = i;
+    }
     return true;
   }
 
-  up() {
+  goUp() {
     if (this.dir === null) return;
-    const from = path.basename(this.dir) || this.dir;
+    const from = path.basename(this.dir) || this.dir; // so we land back on the folder we came out of
     const parent = path.dirname(this.dir);
-    if (parent === this.dir) {
-      if (process.platform === 'win32') this.load(null, this.dir);
-    } else {
-      this.load(parent, from);
-    }
+    if (parent !== this.dir) this.load(parent, from);
+    else if (process.platform === 'win32') this.load(null, this.dir);
   }
 
   open(entry) {
-    if (entry.parent) return this.up();
-    if (entry.isDir) this.load(entry.abs);
+    if (entry.parent) this.goUp();
+    else if (entry.isDir) this.load(entry.abs);
   }
 
   toggle(entry) {
@@ -135,58 +109,33 @@ export class FilePicker {
     else this.selected.set(entry.abs, { isDir: entry.isDir });
   }
 
+  /** Send the selection, or the highlighted item if nothing is selected. */
   send() {
     let paths = [...this.selected.keys()];
     if (paths.length === 0) {
-      const e = this.current;
-      if (!e || e.parent) {
+      const entry = this.current;
+      if (!entry || entry.parent) {
         this.message = 'Nothing selected - press Space on a file or folder first';
         return;
       }
-      paths = [e.abs];
+      paths = [entry.abs];
     }
     this.onSend(paths);
   }
 
-  submitPrompt() {
-    const typed = this.prompt.value;
-    this.prompt = null;
-    if (!typed.trim()) return;
-    const target = expandPath(typed, this.dir ?? process.cwd());
-    let st;
-    try {
-      st = fs.statSync(target);
-    } catch {
-      this.message = `Not found: ${target}`;
-      return;
-    }
-    if (st.isDirectory()) {
-      this.load(target);
-    } else {
-      this.selected.set(target, { isDir: false });
-      if (this.load(path.dirname(target), path.basename(target))) this.message = `Added ${path.basename(target)}`;
-    }
-  }
-
   handleKey(str, key) {
-    if (this.prompt) {
-      const r = this.prompt.handle(str, key);
-      if (r === 'submit') this.submitPrompt();
-      else if (r === 'cancel') this.prompt = null;
-      return;
-    }
-    const rows = Math.max(1, this._rows ?? 10);
     const n = this.entries.length;
     const move = (to) => (this.cursor = Math.max(0, Math.min(n - 1, to)));
+    const page = Math.max(1, this._rows ?? 10);
     switch (key.name) {
       case 'up': return move(this.cursor - 1);
       case 'down': return move(this.cursor + 1);
-      case 'pageup': return move(this.cursor - rows);
-      case 'pagedown': return move(this.cursor + rows);
+      case 'pageup': return move(this.cursor - page);
+      case 'pagedown': return move(this.cursor + page);
       case 'home': return move(0);
       case 'end': return move(n - 1);
       case 'left':
-      case 'backspace': return this.up();
+      case 'backspace': return this.goUp();
       case 'right': return this.current && this.open(this.current);
       case 'return':
       case 'enter':
@@ -201,35 +150,20 @@ export class FilePicker {
     switch (str) {
       case 'k': return move(this.cursor - 1);
       case 'j': return move(this.cursor + 1);
-      case 'h': return this.up();
+      case 'h': return this.goUp();
       case 'l': return this.current && this.open(this.current);
-      case ' ':
-        this.toggle(this.current);
-        return move(this.cursor + 1);
       case 's': return this.send();
-      case '/':
-        this.prompt = new TextInput('');
-        return;
-      case '~': return void this.load(os.homedir());
-      case '.': {
-        this.showHidden = !this.showHidden;
-        const keep = this.current?.name;
-        if (this.dir !== null) this.load(this.dir, keep);
-        this.message = this.showHidden ? 'Showing hidden files' : 'Hiding hidden files';
-        return;
-      }
-      case 'a': {
-        const real = this.entries.filter((e) => !e.parent);
-        const all = real.length > 0 && real.every((e) => this.selected.has(e.abs));
-        for (const e of real) {
-          if (all) this.selected.delete(e.abs);
-          else this.selected.set(e.abs, { isDir: e.isDir });
-        }
-        return;
-      }
       case 'q': return this.onCancel();
+      case '.': return this.toggleHidden();
       default:
     }
+  }
+
+  toggleHidden() {
+    const keep = this.current?.name;
+    this.showHidden = !this.showHidden;
+    if (this.dir !== null) this.load(this.dir, keep);
+    this.message = this.showHidden ? 'Showing hidden files' : 'Hiding hidden files';
   }
 
   _size(abs) {
@@ -243,40 +177,31 @@ export class FilePicker {
     return this._sizes.get(abs);
   }
 
-  /** Lines for a panel with usable area w x h. */
+  /** The picker's lines for a panel with a w x h usable area. */
   view(w, h) {
-    const rows = Math.max(1, h - 3);
+    const rows = Math.max(1, h - 3); // minus: path line, info line, summary line
     this._rows = rows;
     if (this.cursor < this.offset) this.offset = this.cursor;
     if (this.cursor >= this.offset + rows) this.offset = this.cursor - rows + 1;
 
-    const lines = [];
-    if (this.prompt) {
-      const label = 'Go to folder / add file: ';
-      lines.push(paint(label, { fg: C.accent, bold: true }) + this.prompt.render(Math.max(1, w - label.length)));
-      lines.push(paint(fit('Enter to confirm · Esc to cancel · paste or drop a path here', w), { fg: C.muted }));
-    } else {
-      lines.push(paint(fitEnd(this.dir ?? 'This PC', w), { bold: true }));
-      const where = this.message ? paint(fit(this.message, w), { fg: C.warn }) : paint(fit(`${this.entries.filter((e) => !e.parent).length} items`, w), { fg: C.muted });
-      lines.push(where);
-    }
+    const lines = [paint(fitEnd(this.dir ?? 'This PC', w), { bold: true })];
+    const info = this.message || `${this.entries.filter((e) => !e.parent).length} items`;
+    lines.push(paint(fit(info, w), { fg: this.message ? C.warn : C.muted }));
 
     const sizeW = 10;
     const nameW = Math.max(4, w - 2 - 4 - sizeW - 1);
     for (let i = this.offset; i < Math.min(this.entries.length, this.offset + rows); i++) {
       const e = this.entries[i];
-      const isCursor = i === this.cursor;
-      const bg = isCursor ? C.sel : undefined;
+      const onCursor = i === this.cursor;
+      const bg = onCursor ? C.sel : undefined;
       const picked = this.selected.has(e.abs);
       const label = e.parent ? '..' : e.isDir ? `${e.name}${e.name.endsWith('\\') ? '' : '/'}` : e.name;
-      const size = e.parent ? '' : e.isDir ? 'folder' : (() => {
-        const s = this._size(e.abs);
-        return s == null ? '?' : formatBytes(s);
-      })();
+      let size = '';
+      if (!e.parent) size = e.isDir ? 'folder' : (this._size(e.abs) == null ? '?' : formatBytes(this._size(e.abs)));
       lines.push(
-        paint(isCursor ? `${G.pointer} ` : '  ', { fg: C.accent, bg }) +
-          paint(e.parent ? '    ' : picked ? '[x] ' : '[ ] ', { fg: picked ? C.ok : C.muted, bg, bold: picked }) +
-          paint(fit(label, nameW), { fg: e.parent ? C.muted : e.isDir ? C.accent : undefined, bold: isCursor, bg }) +
+        paint(onCursor ? `${G.pointer} ` : '  ', { fg: C.accent, bg }) +
+          paint(e.parent ? '    ' : picked ? '[x] ' : '[ ] ', { fg: picked ? C.ok : C.muted, bold: picked, bg }) +
+          paint(fit(label, nameW), { fg: e.parent ? C.muted : e.isDir ? C.accent : undefined, bold: onCursor, bg }) +
           paint(' ' + padStart(size, sizeW), { fg: C.muted, bg }),
       );
     }
@@ -290,9 +215,9 @@ export class FilePicker {
 
   summary() {
     if (this.selected.size === 0) return 'Nothing selected yet - Space selects, s sends the highlighted item';
-    let bytes = 0;
-    let folders = 0;
     let files = 0;
+    let folders = 0;
+    let bytes = 0;
     for (const [abs, { isDir }] of this.selected) {
       if (isDir) folders++;
       else {

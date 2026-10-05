@@ -1,10 +1,12 @@
-// Wire format. After the TLS handshake every connection carries:
-//   frame   = uint32 big-endian length + UTF-8 JSON
-//   client -> server:  {t:'hello'}  or  {t:'offer', files:[...]}
-//   server -> client:  {t:'hello', name}  or  {t:'reply', ok, reason?}
-// After an accepted offer the sender streams, for each file in order, exactly
-// `s` raw bytes followed by their 32-byte SHA-256. The receiver ends with
-// {t:'result', ok, error?}, which it may also send early to abort the transfer.
+// The wire format. After the TLS handshake a connection carries, in order:
+//
+//   sender   -> receiver   {t:'offer', files:[{p:'dir/a.txt', s:1234}, {p:'empty', d:true}, ...]}
+//   receiver -> sender     {t:'reply', ok:true}   or   {t:'reply', ok:false, reason}
+//   sender   -> receiver   for each file: exactly `s` raw bytes, then their 32-byte SHA-256
+//   receiver -> sender     {t:'result', ok:true}  or   {t:'result', ok:false, error}
+//
+// A frame is a uint32 big-endian length followed by that many bytes of UTF-8 JSON.
+// The receiver may send its 'result' early (e.g. when the user cancels) to stop the sender.
 import { BeamError, CancelledError } from './util.js';
 
 export const VERSION = 1;

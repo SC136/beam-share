@@ -28,7 +28,6 @@ test('two instances discover each other over UDP broadcast, and can then transfe
   assert.equal(seenByA.name, 'bob');
   assert.equal(seenByA.id, b.fingerprint);
   assert.equal(seenByA.port, b.port);
-  assert.equal(seenByA.manual, false);
   assert.equal(seenByB.name, 'alice');
   assert.equal(seenByB.id, a.fingerprint);
 

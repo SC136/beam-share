@@ -5,7 +5,7 @@ import { MAX_FILES } from './protocol.js';
 
 /**
  * Expand the files/folders the user picked into a flat list of entries:
- *   {abs, p, s, m}   regular file (p = '/'-separated path relative to the receiver's folder)
+ *   {abs, p, s}      regular file (p = '/'-separated path relative to the receiver's folder)
  *   {abs, p, d:true} empty directory
  * Symlinks and special files inside folders are skipped (and counted) so a
  * link can't leak files from elsewhere or send the scanner in circles.
@@ -50,7 +50,7 @@ export async function scanPaths(inputs, signal) {
       batch.forEach((f, j) => {
         const st = stats[j];
         if (!st || !st.isFile()) return void skipped++;
-        entries.push({ abs: f.abs, p: f.p, s: st.size, m: Math.round(st.mtimeMs) });
+        entries.push({ abs: f.abs, p: f.p, s: st.size });
         total += st.size;
       });
       check();
@@ -68,7 +68,7 @@ export async function scanPaths(inputs, signal) {
     }
     const base = path.basename(abs) || abs.replace(/[^A-Za-z0-9]/g, '') || 'root';
     if (st.isFile()) {
-      entries.push({ abs, p: base, s: st.size, m: Math.round(st.mtimeMs) });
+      entries.push({ abs, p: base, s: st.size });
       total += st.size;
     } else if (st.isDirectory()) {
       await walk(abs, base);

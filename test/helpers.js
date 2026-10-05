@@ -34,9 +34,9 @@ export async function cleanupAll() {
   while (cleanups.length) await cleanups.pop()();
 }
 
-/** a learns about b by address, like the "add peer" feature. */
-export async function link(a, b) {
-  return a.addPeer(`127.0.0.1:${b.port}`);
+/** a learns about b, exactly as if b's broadcast had arrived (discovery is off in tests). */
+export function link(a, b) {
+  return a.foundPeer({ id: b.fingerprint, name: b.name, address: '127.0.0.1', port: b.port });
 }
 
 /** Accept every incoming offer on `beam`. */

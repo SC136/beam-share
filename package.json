@@ -1,7 +1,7 @@
 {
   "name": "beam-share",
   "version": "0.1.0",
-  "description": "Terminal UI for sharing files peer-to-peer on your local network or, via a relay you host, over the internet. Run `npx beam-share` and send files.",
+  "description": "Terminal UI for sharing files peer-to-peer on your local network. Run `npx beam-share` on two devices and send files.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/SC136/beam-share.git"
@@ -35,8 +35,6 @@
     "tui",
     "terminal",
     "local-network",
-    "internet",
-    "relay",
     "encrypted"
   ],
   "license": "MIT"

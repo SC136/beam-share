@@ -56,6 +56,23 @@ export class CancelledError extends BeamError {
   }
 }
 
+/** Turn a low-level socket error into a sentence a person can act on. */
+export function friendlyNetError(e) {
+  switch (e?.code) {
+    case 'ECONNREFUSED':
+      return new BeamError('connection refused - is beam running there, and is the firewall allowing it?');
+    case 'EHOSTUNREACH':
+    case 'ENETUNREACH':
+      return new BeamError('host unreachable');
+    case 'ETIMEDOUT':
+      return new BeamError('connection timed out');
+    case 'ECONNRESET':
+      return new BeamError('connection reset by peer');
+    default:
+      return e instanceof Error ? e : new BeamError(String(e));
+  }
+}
+
 /** Resolve after `ms`. The timer is unref'd: it is only ever used to bound a wait, and must not keep the process alive. */
 export function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms).unref());
