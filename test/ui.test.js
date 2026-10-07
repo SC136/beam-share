@@ -7,7 +7,8 @@ import path from 'node:path';
 import { localAddresses } from '../src/beam.js';
 import { writeFrame } from '../src/protocol.js';
 import { App, plain } from '../src/ui/app.js';
-import { FilePicker } from '../src/ui/picker.js';
+import { TextInput } from '../src/ui/input.js';
+import { FilePicker, expandPath } from '../src/ui/picker.js';
 import { box, charWidth, fit, fitEnd, padAnsi, paint, progressBar, stripAnsi, strWidth } from '../src/ui/term.js';
 import { autoRespond, cleanupAll, link, makeBeam, rawClient, settled, tmpdir, waitFor } from './helpers.js';
 
@@ -242,6 +243,76 @@ test('picker: the selection survives moving between folders', () => {
   k(p, 'space');
   k(p, 's');
   assert.deepEqual(sent, [[path.join(root, 'alpha.txt'), path.join(root, 'docs', 'readme.md')]]);
+});
+
+test('picker path box: a dropped (quoted) path selects the file, a folder path opens it, a missing path says so', () => {
+  const root = sampleTree();
+  const { p } = pickerFor(root);
+  const submit = (text) => {
+    k(p, '/');
+    assert.ok(p.prompt, 'the path box is open');
+    for (const c of text) p.handleKey(c, { name: c.toLowerCase() });
+    p.handleKey('', { name: 'return' });
+  };
+  submit(`"${path.join(root, 'beta file.txt')}"`); // what a terminal pastes when you drop a file with spaces
+  assert.ok(p.selected.has(path.join(root, 'beta file.txt')));
+  assert.equal(p.current.name, 'beta file.txt');
+  assert.equal(p.prompt, null);
+  submit(path.join(root, 'docs'));
+  assert.equal(p.dir, path.join(root, 'docs'));
+  submit('sub'); // relative to the folder being shown
+  assert.equal(p.dir, path.join(root, 'docs', 'sub'));
+  submit(path.join(root, 'nope'));
+  assert.match(p.message, /Not found/);
+  k(p, '/');
+  p.handleKey('', { name: 'escape' });
+  assert.equal(p.prompt, null, 'Esc closes the box without leaving the picker');
+  assert.equal(p.dir, path.join(root, 'docs', 'sub'));
+});
+
+test('picker path box is drawn, takes over the keys, and fits at every size', async () => {
+  const sender = await makeBeam('a');
+  link(sender, await makeBeam('b'));
+  const app = makeApp(sender, { startDir: sampleTree() });
+  press(app, 's');
+  press(app, '/');
+  type(app, 'x'.repeat(300));
+  assert.match(screen(app), /Go to folder \/ add file:/);
+  assert.match(screen(app), /enter\s+go\s+esc\s+cancel/);
+  for (const [w, h] of [[56, 15], [80, 24], [120, 40]]) assertFrame(app, w, h, `${w}x${h} path box`);
+  press(app, 'esc');
+  assert.equal(app.mode, 'picker', 'the first Esc only closes the box');
+  press(app, 'esc');
+  assert.equal(app.mode, 'main');
+});
+
+test('expandPath handles quotes, escaped spaces, ~ and relative paths', () => {
+  const base = path.resolve('some', 'dir');
+  assert.equal(expandPath('"a b.txt"', base), path.join(base, 'a b.txt'));
+  assert.equal(expandPath("'a b.txt'", base), path.join(base, 'a b.txt'));
+  assert.equal(expandPath('  x.txt  ', base), path.join(base, 'x.txt'));
+  assert.equal(expandPath('~', base), os.homedir());
+  assert.equal(expandPath('~/x', base), path.join(os.homedir(), 'x'));
+  if (process.platform !== 'win32') assert.equal(expandPath('a\ b.txt', base), path.join(base, 'a b.txt'));
+});
+
+test('text input: typing, cursor keys, delete, word delete, and pasted control characters', () => {
+  const t = new TextInput();
+  for (const c of 'hello') t.handle(c, { name: c });
+  t.handle('', { name: 'left' });
+  t.handle('', { name: 'backspace' });
+  assert.equal(t.value, 'helo');
+  t.handle('', { name: 'home' });
+  t.handle('', { name: 'delete' });
+  assert.equal(t.value, 'elo');
+  t.handle('', { name: 'end' });
+  t.handle('', { name: 'w', ctrl: true });
+  assert.equal(t.value, '');
+  t.insert('pasted\r\ntext\u001b[31m');
+  assert.ok(!/[\u0000-\u001f]/.test(t.value), 'control characters never enter the field');
+  assert.equal(t.handle('', { name: 'return' }), 'submit');
+  assert.equal(t.handle('', { name: 'escape' }), 'cancel');
+  assert.equal(strWidth(stripAnsi(new TextInput('x'.repeat(200)).render(20))), 20);
 });
 
 test('picker: escape and q cancel; an unreadable start folder falls back instead of crashing', () => {

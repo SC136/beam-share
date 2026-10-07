@@ -60,7 +60,9 @@ function statusLine(app) {
 function footer(app, w) {
   let keys;
   if (app.mode === 'picker') {
-    keys = [['↑↓', 'move'], ['←→', 'up/open'], ['space', 'select'], ['s', 'send'], ['.', 'hidden'], ['esc', 'back']];
+    keys = app.picker.prompt
+      ? [['enter', 'go'], ['esc', 'cancel']]
+      : [['↑↓', 'move'], ['←→', 'up/open'], ['space', 'select'], ['s', 'send'], ['/', 'path'], ['.', 'hidden'], ['esc', 'back']];
   } else if (app.mode === 'help') {
     keys = [['any key', 'close']];
   } else if (app.offers.length) {
@@ -254,6 +256,7 @@ function helpScreen(w, h) {
     { heading: 'File picker' },
     ['space', 'select / unselect (files and whole folders)'],
     ['enter / →', 'open folder     ← / backspace: go up'],
+    ['/', 'type or paste a path (drag a file onto the terminal)'],
     ['.', 'show / hide hidden files'],
     ['s', 'send the selection (or the highlighted item)'],
     ['esc', 'back'],

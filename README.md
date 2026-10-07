@@ -33,7 +33,7 @@ Run it on two devices on the same Wi-Fi / LAN. They find each other automaticall
 | `?` | help |
 | `q` / `Ctrl+C` | quit (asks first if a transfer is running) |
 
-In the file picker: `Space` selects files **and whole folders**, `Enter`/`→` opens a folder, `←` goes up, `.` shows hidden files, `s` sends, `Esc` goes back.
+In the file picker: `Space` selects files **and whole folders**, `Enter`/`→` opens a folder, `←` goes up, `/` opens a path box (type or paste a path, or **drag a file onto the terminal**), `.` shows hidden files, `s` sends, `Esc` goes back.
 
 Received files go to `~/Downloads/beam` (`--dir` to change). Nothing is ever overwritten: an existing `notes.txt` makes the new one `notes (1).txt`.
 
@@ -73,10 +73,11 @@ src/safepath.js      makes file names from the network safe
 src/scan.js          expands folders into file lists
 src/ui/app.js        UI state and keys
 src/ui/screens.js    everything the UI draws
-src/ui/picker.js     the file browser
+src/ui/picker.js     the file browser (and the path box)
+src/ui/input.js      a one-line text field
 src/ui/term.js       terminal basics: colours, widths, boxes, redraw
 src/ui/art.js        logo and cat
-test/                66 tests (real TLS and UDP; no mocks of the network)
+test/                70 tests (real TLS and UDP; no mocks of the network)
 ```
 
 No runtime dependencies.
@@ -95,6 +96,6 @@ If no devices appear: both must be on the same network (guest and campus Wi-Fi o
 ## Development
 
 ```
-npm test              # 66 tests, about 10 seconds
+npm test              # 70 tests, about 10 seconds
 node bin/beam.js      # run from source
 ```

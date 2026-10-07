@@ -1,10 +1,21 @@
 // A keyboard-driven file browser for choosing what to send.
 // Arrows move, Space selects (files or whole folders), Enter/→ opens a folder, ← goes up, s sends.
+// `/` opens a path box: type or paste a path, or drag a file onto the terminal (which pastes its path).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { formatBytes } from '../util.js';
+import { TextInput } from './input.js';
 import { C, G, fit, fitEnd, padStart, paint } from './term.js';
+
+/** Turn text typed or dropped into the path box into an absolute path. */
+export function expandPath(input, base) {
+  let s = String(input).trim();
+  if (s.length >= 2 && ((s[0] === '"' && s.at(-1) === '"') || (s[0] === "'" && s.at(-1) === "'"))) s = s.slice(1, -1); // dropped paths with spaces are quoted
+  if (process.platform !== 'win32') s = s.replace(/\\(.)/g, '$1'); // macOS/Linux terminals backslash-escape spaces instead
+  if (s === '~' || s.startsWith('~/') || s.startsWith('~\\')) s = path.join(os.homedir(), s.slice(1));
+  return path.resolve(base, s);
+}
 
 /** On Windows the "parent of C:\" is the list of drives. */
 function listDrives() {
@@ -33,6 +44,7 @@ export class FilePicker {
     this.selected = new Map(); // abs path -> {isDir}; survives moving between folders
     this.showHidden = false;
     this.message = '';
+    this.prompt = null; //     the path box (a TextInput) while it is open
     this._sizes = new Map(); // file sizes, looked up lazily
     if (!this.load(startDir) && !this.load(os.homedir())) this.load(path.parse(process.cwd()).root);
   }
@@ -123,7 +135,34 @@ export class FilePicker {
     this.onSend(paths);
   }
 
+  /** Enter pressed in the path box: open the folder, or select the file and show it. */
+  submitPrompt() {
+    const typed = this.prompt.value;
+    this.prompt = null;
+    if (!typed.trim()) return;
+    const target = expandPath(typed, this.dir ?? process.cwd());
+    let stat;
+    try {
+      stat = fs.statSync(target);
+    } catch {
+      this.message = `Not found: ${target}`;
+      return;
+    }
+    if (stat.isDirectory()) {
+      this.load(target);
+    } else {
+      this.selected.set(target, { isDir: false });
+      if (this.load(path.dirname(target), path.basename(target))) this.message = `Added ${path.basename(target)}`;
+    }
+  }
+
   handleKey(str, key) {
+    if (this.prompt) {
+      const result = this.prompt.handle(str, key);
+      if (result === 'submit') this.submitPrompt();
+      else if (result === 'cancel') this.prompt = null;
+      return;
+    }
     const n = this.entries.length;
     const move = (to) => (this.cursor = Math.max(0, Math.min(n - 1, to)));
     const page = Math.max(1, this._rows ?? 10);
@@ -153,6 +192,9 @@ export class FilePicker {
       case 'h': return this.goUp();
       case 'l': return this.current && this.open(this.current);
       case 's': return this.send();
+      case '/':
+        this.prompt = new TextInput('');
+        return;
       case 'q': return this.onCancel();
       case '.': return this.toggleHidden();
       default:
@@ -184,9 +226,16 @@ export class FilePicker {
     if (this.cursor < this.offset) this.offset = this.cursor;
     if (this.cursor >= this.offset + rows) this.offset = this.cursor - rows + 1;
 
-    const lines = [paint(fitEnd(this.dir ?? 'This PC', w), { bold: true })];
-    const info = this.message || `${this.entries.filter((e) => !e.parent).length} items`;
-    lines.push(paint(fit(info, w), { fg: this.message ? C.warn : C.muted }));
+    const lines = [];
+    if (this.prompt) {
+      const label = 'Go to folder / add file: ';
+      lines.push(paint(label, { fg: C.accent, bold: true }) + this.prompt.render(Math.max(1, w - label.length)));
+      lines.push(paint(fit('Enter to confirm, Esc to cancel. Paste a path, or drag a file onto the terminal.', w), { fg: C.muted }));
+    } else {
+      lines.push(paint(fitEnd(this.dir ?? 'This PC', w), { bold: true }));
+      const info = this.message || `${this.entries.filter((e) => !e.parent).length} items`;
+      lines.push(paint(fit(info, w), { fg: this.message ? C.warn : C.muted }));
+    }
 
     const sizeW = 10;
     const nameW = Math.max(4, w - 2 - 4 - sizeW - 1);
